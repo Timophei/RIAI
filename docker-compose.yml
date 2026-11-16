@@ -1,0 +1,7 @@
+services:
+  app:
+    build: .
+    image: supply-ai:stage1
+    env_file: .env
+    volumes:
+      - ./data:/data
