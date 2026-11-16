@@ -123,3 +123,51 @@ class B24:
             if progress:
                 progress(len(items), total)
         return items
+
+    def iter_pages(self, method, params, filter_param, id_field, extract=lambda r: r,
+                   start_after=0, pause=None):
+        """Постраничная выгрузка «окнами» по курсору ID (>ID): в памяти — только текущее окно,
+        после каждого окна можно сохранить курсор и продолжить после сбоя.
+        Выдаёт (страница_элементов, получено_всего, примерно_всего)."""
+        size = int(os.environ.get("B24_PAGES_PER_BATCH", "10"))
+        pause = float(os.environ.get("B24_PAUSE", "0.3")) if pause is None else pause
+        id_key = id_field.upper() if filter_param == "FILTER" else id_field
+        last, got = start_after, 0
+        while True:
+            p = dict(params)
+            p[filter_param] = dict(params.get(filter_param) or {}, **{f">{id_key}": last})
+            try:
+                first = self.call(method, dict(p, start=0))
+            except B24Transient:
+                time.sleep(5)
+                first = self.call(method, dict(p, start=0))
+            page0 = list(extract(first.get("result")) or [])
+            remaining = int(first.get("total") or len(page0))
+            if not page0:
+                return
+            pages = [page0]
+            starts = list(range(50, min(remaining, size * 50), 50))
+            while starts:
+                try:
+                    if len(starts) == 1:
+                        res = {f"p{starts[0]}": self.call(method, dict(p, start=starts[0])).get("result")}
+                    else:
+                        res = self.batch({f"p{s}": (method, dict(p, start=s)) for s in starts})
+                except B24Transient as e:
+                    if len(starts) == 1:
+                        raise
+                    size = max(2, size // 2) if size > 2 else 1
+                    starts = starts[:max(1, size - 1)]
+                    print(f"\n  портал не справился с пачкой, уменьшаю до {size} стр.", flush=True)
+                    continue
+                pages += [list(extract(res.get(f"p{s}")) or []) for s in starts]
+                break
+            for pg in pages:
+                if pg:
+                    got += len(pg)
+                    last = max(last, max(int(x[id_field]) for x in pg))
+                    yield pg, got, got + max(0, remaining - sum(len(q) for q in pages))
+            if remaining <= sum(len(q) for q in pages):
+                return
+            if pause:
+                time.sleep(pause)

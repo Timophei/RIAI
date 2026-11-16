@@ -18,13 +18,18 @@ git clone https://github.com/Timophei/RIAI.git /opt/riai && cd /opt/riai
 cp .env.example .env && nano .env        # вставить B24_WEBHOOK
 docker compose build
 docker compose run --rm app discover     # проверить, что поля найдены верно
-docker compose run --rm app sync --full  # первая загрузка
+nohup docker compose run --rm -T app sync --full > data/sync_full.log 2>&1 &   # первая загрузка, в фоне
+tail -f data/sync_full.log               # ход загрузки (Ctrl+C — выйти из просмотра, загрузка продолжится)
 docker compose run --rm app report       # отчёт по 4 позициям из примера
 docker compose run --rm app report "Электроды УОНИ 13/55 4мм" "Перчатки х/б"
 ```
 
 Если `discover` ошибся с полем или списком — поправьте `data/config.json` вручную
 (или задайте ID в `.env`) и запустите `sync --full`.
+
+Загрузка идёт окнами по 500 записей и сразу пишет их в базу (≈35 МБ памяти).
+Если она прервалась — просто запустите `sync --full` ещё раз: продолжит с места остановки.
+Начать заново: `sync --restart`. Контейнер ограничен 700 МБ памяти и 1 ядром (`RIAI_MEM` в `.env`).
 
 ### Синхронизация по расписанию
 

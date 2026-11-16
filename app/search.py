@@ -3,6 +3,7 @@
 import re
 from collections import defaultdict
 
+import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from . import db
@@ -24,9 +25,28 @@ def price_ok(p):
 
 
 class Index:
+    """В памяти — только уникальные нормализованные названия; предложения читаются из базы для найденного."""
+
     def __init__(self, con=None):
-        con = con or db.connect()
-        rows = con.execute("""
+        self.con = con or db.connect()
+        groups = defaultdict(list)
+        for pid, name in self.con.execute("""
+                SELECT o.position_id, COALESCE(p.name, MAX(o.name)) FROM offers o
+                LEFT JOIN positions p ON p.id = o.position_id
+                WHERE o.position_id IS NOT NULL GROUP BY o.position_id"""):
+            n = norm(name)
+            if n:
+                groups[n].append(pid)
+        self.names = list(groups)
+        self.pids = [groups[n] for n in self.names]
+        del groups
+        self.vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1, sublinear_tf=True,
+                                   dtype=np.float32)
+        self.X = self.vec.fit_transform(self.names) if self.names else None
+
+    def _load(self, pids):
+        q = ",".join("?" * len(pids))
+        rows = self.con.execute(f"""
             SELECT o.id, o.position_id, COALESCE(p.name, o.name) AS name, o.price, o.selected,
                    o.comment, o.date_create, o.request_id, r.company_id, c.title AS company,
                    p.unit, p.qty, p.weight, p.status, p.purchase_id
@@ -34,19 +54,16 @@ class Index:
             LEFT JOIN positions p ON p.id = o.position_id
             LEFT JOIN requests r ON r.id = o.request_id
             LEFT JOIN companies c ON c.id = r.company_id
-        """).fetchall()
+            WHERE o.position_id IN ({q})""", pids).fetchall()
         pos = {}
         for r in rows:
-            key = r["position_id"] or -r["id"]
-            p = pos.setdefault(key, {"position_id": r["position_id"], "name": r["name"], "unit": r["unit"],
-                                     "qty": r["qty"], "weight": r["weight"], "status": r["status"],
-                                     "purchase_id": r["purchase_id"], "offers": []})
+            p = pos.setdefault(r["position_id"], {
+                "position_id": r["position_id"], "name": r["name"], "unit": r["unit"], "qty": r["qty"],
+                "weight": r["weight"], "status": r["status"], "purchase_id": r["purchase_id"], "offers": []})
             p["offers"].append(dict(r))
-        self.items = [p for p in pos.values() if p["name"]]
-        for p in self.items:
+        for p in pos.values():
             p["date"] = min((o["date_create"] or "" for o in p["offers"]), key=_sort_date)
-        self.vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1, sublinear_tf=True)
-        self.X = self.vec.fit_transform([norm(p["name"]) for p in self.items]) if self.items else None
+        return pos
 
     def search(self, query, k=10, exclude_purchase=None):
         if self.X is None:
@@ -56,10 +73,12 @@ class Index:
         for i in sims.argsort()[::-1]:
             if sims[i] < NOT_FOUND or len(out) >= k:
                 break
-            p = self.items[i]
-            if exclude_purchase and p["purchase_id"] == exclude_purchase:
-                continue
-            out.append(dict(p, score=float(sims[i])))
+            pos = self._load(self.pids[i])
+            for p in sorted(pos.values(), key=lambda p: _sort_date(p["date"]), reverse=True):
+                if exclude_purchase and p["purchase_id"] == exclude_purchase:
+                    continue
+                if len(out) < k:
+                    out.append(dict(p, score=float(sims[i])))
         return out
 
 

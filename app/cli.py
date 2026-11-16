@@ -1,6 +1,8 @@
 """Команды:
   discover          — найти ID списков/смарт-процессов и поля, записать data/config.json
-  sync [--full]     — загрузить изменения (или всё) из Битрикс24 в data/supply.db
+  sync [--full]     — загрузить изменения (или всё) из Битрикс24 в data/supply.db;
+                      прерванная полная загрузка продолжается с места остановки
+  sync --restart    — начать полную загрузку заново
   report [запросы]  — отчёт по позициям, напр.: report "Бумага А4" "Швеллер 40"
 """
 import sys
@@ -17,7 +19,7 @@ def main():
         run()
     elif cmd == "sync":
         from .sync import run
-        run(full="--full" in rest)
+        run(full="--full" in rest, restart="--restart" in rest)
     elif cmd == "report":
         from .report import run
         run(rest or None)
