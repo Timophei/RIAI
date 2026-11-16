@@ -10,6 +10,10 @@ class B24Error(Exception):
     pass
 
 
+class B24Transient(B24Error):
+    """Сервер не ответил нормально (пустой ответ, таймаут, 5xx) — можно повторить меньшей пачкой."""
+
+
 def php_query(params, prefix=None):
     """Собирает строку запроса в стиле PHP http_build_query (для batch)."""
     parts = []
@@ -53,14 +57,18 @@ class B24:
                                 timeout=120, verify=self.verify)
             except requests.RequestException as e:
                 if attempt == retries - 1:
-                    raise B24Error(f"{method}: сеть: {e}")
+                    raise B24Transient(f"{method}: сеть: {e}")
                 time.sleep(2 ** attempt)
                 continue
             self.calls += 1
             try:
                 data = r.json()
             except ValueError:
-                raise B24Error(f"{method}: HTTP {r.status_code}, не JSON: {r.text[:300]}")
+                # Пустой или обрезанный ответ — обычно сервер упёрся в лимит памяти/времени PHP
+                if attempt < 1:
+                    time.sleep(3)
+                    continue
+                raise B24Transient(f"{method}: HTTP {r.status_code}, не JSON: {r.text[:300]!r}")
             err = data.get("error")
             if err in ("QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT") or r.status_code == 503:
                 time.sleep(2 ** attempt)
@@ -68,7 +76,7 @@ class B24:
             if err:
                 raise B24Error(f"{method}: {err}: {data.get('error_description')}")
             return data
-        raise B24Error(f"{method}: превышено число попыток")
+        raise B24Transient(f"{method}: превышено число попыток")
 
     def batch(self, cmds):
         """cmds: dict key -> (method, params). Не больше 50 за вызов."""
@@ -85,19 +93,33 @@ class B24:
             raise B24Error(f"batch: {len(errors)} ошибок, например {k}: {v}")
         return out
 
-    def list_all(self, method, params, extract=lambda r: r, page=50, progress=None):
-        """Все страницы списочного метода: первый вызов узнаёт total, остальные — пачками через batch."""
+    def list_all(self, method, params, extract=lambda r: r, page=50, progress=None, pages_per_batch=None):
+        """Все страницы списочного метода: первый вызов узнаёт total, остальные — пачками через batch.
+        Если сервер не справляется с пачкой, она автоматически уменьшается вплоть до одиночных вызовов."""
+        size = pages_per_batch or int(os.environ.get("B24_PAGES_PER_BATCH", "10"))
         first = self.call(method, dict(params, start=0))
         items = list(extract(first.get("result")) or [])
         total = int(first.get("total") or len(items))
         if progress:
             progress(len(items), total)
         starts = list(range(page, total, page))
-        for i in range(0, len(starts), 50):
-            cmds = {f"p{s}": (method, dict(params, start=s)) for s in starts[i:i + 50]}
-            res = self.batch(cmds)
-            for s in starts[i:i + 50]:
+        i = 0
+        while i < len(starts):
+            chunk = starts[i:i + size]
+            try:
+                if len(chunk) == 1:
+                    res = {f"p{chunk[0]}": self.call(method, dict(params, start=chunk[0])).get("result")}
+                else:
+                    res = self.batch({f"p{s}": (method, dict(params, start=s)) for s in chunk})
+            except B24Transient as e:
+                if size == 1:
+                    raise
+                size = max(1, size // 2)
+                print(f"\n  сервер не справился с пачкой ({e.__class__.__name__}), уменьшаю до {size} стр.")
+                continue
+            for s in chunk:
                 items.extend(extract(res.get(f"p{s}")) or [])
+            i += len(chunk)
             if progress:
                 progress(len(items), total)
         return items
