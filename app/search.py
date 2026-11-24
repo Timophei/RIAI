@@ -49,7 +49,7 @@ class Index:
         rows = self.con.execute(f"""
             SELECT o.id, o.position_id, COALESCE(p.name, o.name) AS name, o.price, o.selected,
                    o.comment, o.date_create, o.request_id, r.company_id, c.title AS company,
-                   p.unit, p.qty, p.weight, p.status, p.purchase_id
+                   r.purchase_id AS purchase_id, p.unit, p.qty, p.weight, p.status
             FROM offers o
             LEFT JOIN positions p ON p.id = o.position_id
             LEFT JOIN requests r ON r.id = o.request_id
@@ -59,10 +59,12 @@ class Index:
         for r in rows:
             p = pos.setdefault(r["position_id"], {
                 "position_id": r["position_id"], "name": r["name"], "unit": r["unit"], "qty": r["qty"],
-                "weight": r["weight"], "status": r["status"], "purchase_id": r["purchase_id"], "offers": []})
+                "weight": r["weight"], "status": r["status"], "offers": []})
             p["offers"].append(dict(r))
         for p in pos.values():
             p["date"] = min((o["date_create"] or "" for o in p["offers"]), key=_sort_date)
+            purchases = {o["purchase_id"] for o in p["offers"] if o["purchase_id"]}
+            p["purchase_ids"] = sorted(purchases)
         return pos
 
     def search(self, query, k=10, exclude_purchase=None, exclude_pids=()):
@@ -75,8 +77,12 @@ class Index:
                 break
             pos = self._load(self.pids[i])
             for p in sorted(pos.values(), key=lambda p: _sort_date(p["date"]), reverse=True):
-                if (exclude_purchase and p["purchase_id"] == exclude_purchase) or p["position_id"] in exclude_pids:
+                if p["position_id"] in exclude_pids:
                     continue
+                if exclude_purchase:  # предложения текущей закупки — не история
+                    p["offers"] = [o for o in p["offers"] if o["purchase_id"] != exclude_purchase]
+                    if not p["offers"]:
+                        continue
                 if len(out) < k:
                     out.append(dict(p, score=float(sims[i])))
         return out

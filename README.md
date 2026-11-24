@@ -47,12 +47,20 @@ docker compose run --rm app report "Электроды УОНИ 13/55 4мм" "П
 
 ## Этап 2: API подсказок + вкладка-компонент на портале
 
-Схема: компонент-вкладка в карточке Закупки (как «Аналитическая справка») → AJAX на портале
-`/local/ajax/riai_advice.php` (проверяет права на закупку) → `POST https://b-integration.ru/supply-ai/api/advice`
-с ключом `X-Api-Key` → ответ: JSON (позиции, у кого брали, лучшие цены, сводка по поставщикам) и готовый HTML-фрагмент.
+Портал собирает позиции закупки сам и отправляет их серверу; сервер возвращает историю с ID —
+ссылки на поставщиков, запросы и закупки строит портал.
 
-Если позиции не переданы, сервер находит их сам: Закупка → её подзаявки → позиции с этими подзаявками
-(+ позиции, по которым уже есть запросы поставщику этой закупки).
+```
+вкладка (компонент) → /local/ajax/riai_advice.php (права на закупку, сбор позиций, отрисовка)
+                     → POST https://b-integration.ru/supply-ai/api/advice  (X-Api-Key)
+```
+
+Запрос: `{"purchase_id": 23504, "positions": [{"id": 1, "name": "Соль техническая", "qty": 100, "unit": "кг"}]}`
+Ответ (по каждой позиции): `status` (found / asked / new), `last_selected`, `best_price`,
+`matches[]` — похожие позиции истории со всеми предложениями. Предложение:
+`{offer_id, position_id, position, company_id, company, request_id, purchase_id, price, selected, date}`.
+Плюс `suppliers[]` — кому отправить запросы (`company_id`, по каким позициям, сколько раз выбирали, последнее предложение).
+Предложения текущей закупки и сами переданные позиции в историю не попадают. Полный контракт — в `bitrix/RiaiAdvice.php`.
 
 ### Сервер
 ```bash
@@ -70,12 +78,12 @@ location /supply-ai/ {
     proxy_read_timeout 120s;
 }
 ```
-Проверка в браузере: `https://b-integration.ru/supply-ai/preview?purchase=<ID закупки>&key=<API_KEY>`
+Проверка в браузере: `https://b-integration.ru/supply-ai/preview?key=<API_KEY>&q=Соль техническая&q=Швеллер 20`
 
 ### Портал (папка `bitrix/`)
-- `RiaiAdvice.php` → `/local/php_interface/lib/`, подключить в `init.php`; задать `riai_api_url` и `riai_api_key`.
-- `riai_advice_ajax.php` → `/local/ajax/riai_advice.php`.
-- `tab_template_example.php` — пример шаблона вкладки: грузит подсказки после открытия, кнопка «Обновить».
+- `RiaiAdvice.php` → `/local/php_interface/lib/`, подключить в `init.php`; задать `riai_api_key`.
+- `riai_advice_ajax.php` → `/local/ajax/riai_advice.php`. Функцию `riaiPurchasePositions()` замените
+  выборкой, которой строится вкладка «Позиции закупок». Внизу файла — JS для вставки во вкладку.
 
 ## Дальше
 - Кнопка «Создать запросы»: по запросу на поставщика + «Позиции предложения» с пустой ценой.
