@@ -81,8 +81,10 @@ def advise(purchase_id, positions, k=8):
             pids.add(int(p.get("id")))
         except (TypeError, ValueError):
             pass
-    out, by_sup = [], {}
+    out, by_sup, by_pur = [], {}, {}
+    best_up = {}  # позиция -> лучшая сопоставимая цена за базовую единицу (для индекса цены поставщика)
     for p in positions:
+        pid_cur = p.get("id")
         want, _ = basis(p.get("name"), p.get("unit"), p.get("weight"))
         hits = idx.search(p.get("name") or "", k=k, exclude_purchase=purchase_id, exclude_pids=pids)
         offers = [o for h in hits for o in h["offers"]]
@@ -91,20 +93,50 @@ def advise(purchase_id, positions, k=8):
         # лучшая цена — только среди сопоставимых единиц, по цене за базовую единицу
         priced = sorted([x for x in ((_offer(o, want), o) for o in offers if price_ok(o["price"]))
                          if x[0]["comparable"]], key=lambda x: x[0]["unit_price"])
-        for o in offers:
-            if not o["company_id"]:
-                continue
-            d = by_sup.setdefault(o["company_id"], {"company_id": o["company_id"], "company": o["company"],
-                                                   "position_ids": [], "offers": 0, "wins": 0, "last": None})
-            if p.get("id") not in d["position_ids"]:
-                d["position_ids"].append(p.get("id"))
-            d["offers"] += 1
-            d["wins"] += 1 if o["selected"] else 0
-            if price_ok(o["price"]) and (d["last"] is None or
-                                         _sort_date(o["date_create"]) > _sort_date(d["last"]["date"])):
-                d["last"] = _offer(o, want)
+        if priced:
+            best_up[pid_cur] = priced[0][0]["unit_price"]
+        for h in hits:
+            for o in h["offers"]:
+                of = _offer(o, want)
+                # --- поставщики ---
+                if o["company_id"]:
+                    d = by_sup.setdefault(o["company_id"], {
+                        "company_id": o["company_id"], "company": o["company"], "position_ids": [],
+                        "offers": 0, "wins": 0, "relevance": 0.0, "last": None, "purchase_ids": [],
+                        "_best": {}, "_rel": {}})
+                    if pid_cur not in d["position_ids"]:
+                        d["position_ids"].append(pid_cur)
+                    d["offers"] += 1
+                    d["wins"] += 1 if o["selected"] else 0
+                    d["_rel"][pid_cur] = max(d["_rel"].get(pid_cur, 0), h["score"])
+                    if o["purchase_id"] and o["purchase_id"] not in d["purchase_ids"]:
+                        d["purchase_ids"].append(o["purchase_id"])
+                    # последнее предложение — даже без цены, но при равной дате предпочитаем с ценой
+                    if d["last"] is None or (_sort_date(of["date"]), of["price"] is not None) > \
+                            (_sort_date(d["last"]["date"]), d["last"]["price"] is not None):
+                        d["last"] = of
+                    if of["comparable"] and of["unit_price"] is not None:
+                        cur = d["_best"].get(pid_cur)
+                        if cur is None or of["unit_price"] < cur:
+                            d["_best"][pid_cur] = of["unit_price"]
+                # --- прошлые закупки ---
+                if o["purchase_id"]:
+                    g = by_pur.setdefault(o["purchase_id"], {"purchase_id": o["purchase_id"], "date": of["date"],
+                                                             "position_ids": [], "matched": {}, "_sup": {}})
+                    if _sort_date(of["date"]) > _sort_date(g["date"]):
+                        g["date"] = of["date"]
+                    if pid_cur not in g["position_ids"]:
+                        g["position_ids"].append(pid_cur)
+                    g["matched"].setdefault(pid_cur, [])
+                    if h["name"] not in g["matched"][pid_cur]:
+                        g["matched"][pid_cur].append(h["name"])
+                    key = o["company_id"] or f"r{o['request_id']}"
+                    gs = g["_sup"].setdefault(key, {"company_id": o["company_id"], "company": o["company"],
+                                                    "wins": 0, "offers": []})
+                    gs["wins"] += 1 if o["selected"] else 0
+                    gs["offers"].append(dict(of, for_position_id=pid_cur))
         out.append({
-            "id": p.get("id"), "name": p.get("name"), "qty": p.get("qty"), "unit": p.get("unit"),
+            "id": pid_cur, "name": p.get("name"), "qty": p.get("qty"), "unit": p.get("unit"),
             "base_unit": label(want),
             "status": "found" if won else "asked" if hits else "new",   # брали / только запрашивали / не было
             "last_selected": _offer(won[0], want) if won else None,
@@ -115,10 +147,29 @@ def advise(purchase_id, positions, k=8):
                          "offers": [_offer(o, want) for o in sorted(h["offers"], key=lambda o: (-(o["selected"] or 0),
                                                                                                  o["price"] or 1e18))]}
                         for h in hits]})
-    sups = sorted(by_sup.values(), key=lambda d: (-len(d["position_ids"]), -d["wins"], -d["offers"]))[:20]
+
+    # Поставщики. price_index: в среднем по позициям, во сколько раз дороже лучшей цены (1.0 — самый дешёвый)
+    sups = []
+    for d in by_sup.values():
+        ratios = [v / best_up[k] for k, v in d.pop("_best").items() if best_up.get(k)]
+        d["price_index"] = round(sum(ratios) / len(ratios), 2) if ratios else None
+        d["relevance"] = round(sum(d.pop("_rel").values()), 2)
+        d["last_date"] = d["last"]["date"] if d["last"] else ""
+        sups.append(d)
+    # Порядок по умолчанию: больше позиций этой закупки → чаще выбирали → ближе по смыслу → свежее
+    sups.sort(key=lambda d: (-len(d["position_ids"]), -d["wins"], -d["relevance"],
+                             tuple(-int(x or 0) for x in _sort_date(d["last_date"]))))
+    # Прошлые закупки: больше совпавших позиций → свежее
+    purs = []
+    for g in by_pur.values():
+        g["suppliers"] = sorted(g.pop("_sup").values(), key=lambda x: (-x["wins"], -len(x["offers"])))
+        purs.append(g)
+    purs.sort(key=lambda g: (-len(g["position_ids"]), tuple(-int(x or 0) for x in _sort_date(g["date"]))))
     return {"ok": True, "purchase_id": purchase_id,
             "updated": (_state["sync"] or "")[:16].replace("T", " "),
-            "positions": out, "suppliers": sups}
+            "sort": {"suppliers": "позиций этой закупки ↓, выбирали ↓, похожесть ↓, дата ↓",
+                     "purchases": "совпавших позиций ↓, дата ↓"},
+            "positions": out, "suppliers": sups[:25], "purchases": purs[:15]}
 
 
 # ---------- HTML для проверки (/preview); на портале HTML строит ваш модуль из JSON ----------
@@ -199,15 +250,35 @@ def to_html(d):
         rows.append(f'<tr><td>{n}</td><td>{e(p["name"])}{m}</td><td>{e(p["qty"])} {e(p["unit"])}</td>'
                     f'<td>{last}</td><td>{off(p["best_price"])}</td></tr>')
     nums = {p["id"]: n for n, p in enumerate(d["positions"], 1)}
+
+    def purl(ids):
+        return ", ".join(f'<a href="{L["purchase"](i)}" target="_blank">{i}</a>' for i in ids[:5])
+
     sup = "".join(
         f'<tr><td><a href="{L["company"](s["company_id"])}" target="_blank">{e(s["company"])}</a></td>'
-        f'<td>{", ".join("№%s" % nums.get(i, i) for i in s["position_ids"])}</td><td>{s["offers"]}</td><td>{s["wins"]}</td>'
-        f'<td>{off(s["last"])}</td></tr>' for s in d["suppliers"])
+        f'<td>{", ".join("№%s" % nums.get(i, i) for i in s["position_ids"])}</td><td>{s["wins"]}</td><td>{s["offers"]}</td>'
+        f'<td>{"лучшая" if s["price_index"] == 1 else (s["price_index"] or "нет цены")}</td>'
+        f'<td>{off(s["last"])}</td>'
+        f'<td>{purl(s["purchase_ids"])}</td></tr>'
+        for s in d["suppliers"])
+    pur = "".join(
+        f'<tr><td><a href="{L["purchase"](g["purchase_id"])}" target="_blank">закупка {g["purchase_id"]}</a></td>'
+        f'<td>{e(g["date"])}</td><td>' +
+        "<br>".join(f'№{nums.get(i, i)} <span class="muted">как «{e("», «".join(g["matched"].get(i, [])))}»</span>'
+                    for i in g["position_ids"]) + "</td><td>" +
+        "<br>".join(f'{e(x["company"] or "—")}: ' + "; ".join(
+            f'№{nums.get(o["for_position_id"], "")} {fmt_price(o["price"])}{" ✓" if o["selected"] else ""}'
+            for o in x["offers"]) for x in g["suppliers"]) + "</td></tr>"
+        for g in d.get("purchases", []))
     return (f'<style>{CSS}</style><div class="note">Данные на {e(d["updated"])}. Предложения закупки {d["purchase_id"]} '
             f'исключены.</div><h3>Позиции</h3><table><tr><th>№</th><th>Позиция</th><th>Кол-во</th>'
             f'<th>Последний раз выбрали</th><th>Лучшая цена в истории</th></tr>{"".join(rows)}</table>'
-            f'<h3>Кому отправить запросы</h3><table><tr><th>Поставщик</th><th>По позициям</th><th>Предложений</th>'
-            f'<th>Выбирали</th><th>Последнее предложение</th></tr>{sup}</table>')
+            f'<h3>Кому отправить запросы</h3><div class="note">Порядок: {e(d["sort"]["suppliers"])}. '
+            f'«Цена» — во сколько раз дороже лучшей по тем же позициям.</div>'
+            f'<table><tr><th>Поставщик</th><th>Позиции</th><th>Выбирали</th><th>Предложений</th><th>Цена</th>'
+            f'<th>Последнее предложение</th><th>Закупки</th></tr>{sup}</table>'
+            f'<h3>Похожие прошлые закупки</h3><div class="note">Порядок: {e(d["sort"]["purchases"])}.</div>'
+            f'<table><tr><th>Закупка</th><th>Дата</th><th>Совпали позиции</th><th>Поставщики (✓ — выбран)</th></tr>{pur}</table>')
 
 
 # ---------- маршруты ----------

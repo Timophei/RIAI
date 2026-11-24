@@ -134,19 +134,81 @@ $num = [];
 <?php if (!$r['suppliers']): ?>
 <div class="note">По истории предложить некого — позиции новые.</div>
 <?php else: ?>
-<table>
-<tr><th>Поставщик</th><th>По позициям</th><th>Предложений</th><th>Выбирали</th><th>Последнее предложение</th></tr>
-<?php foreach ($r['suppliers'] as $s): ?>
+<div class="note">Порядок: <?= $h($r['sort']['suppliers'] ?? '') ?>. Нажмите на заголовок столбца, чтобы пересортировать.
+«Цена» — насколько поставщик дороже лучшей цены по тем же позициям (1,00 — самый дешёвый, 1,25 — на 25% дороже).</div>
+<table class="riai-sort">
 <tr>
-  <td><a href="<?= $lnkCompany($s['company_id']) ?>" target="_blank"><?= $h($s['company']) ?></a></td>
-  <td><?= implode(', ', array_map(fn($id) => '№' . ($num[$id] ?? $id), $s['position_ids'])) ?></td>
-  <td><?= (int)$s['offers'] ?></td>
-  <td><?= (int)$s['wins'] ?></td>
-  <td><?= $offer($s['last']) ?></td>
+  <th onclick="riaiSort(this,'text',true)">Поставщик</th>
+  <th onclick="riaiSort(this,'num')">Позиции</th>
+  <th onclick="riaiSort(this,'num')">Выбирали</th>
+  <th onclick="riaiSort(this,'num')">Предложений</th>
+  <th onclick="riaiSort(this,'num',true)">Цена</th>
+  <th onclick="riaiSort(this,'num')">Последнее предложение</th>
+  <th onclick="riaiSort(this,'num')">Закупки</th>
+</tr>
+<?php foreach ($r['suppliers'] as $s):
+    $d = $s['last_date'] ? (int)implode('', array_reverse(explode('.', $s['last_date']))) : 0; ?>
+<tr>
+  <td data-v="<?= $h($s['company']) ?>"><a href="<?= $lnkCompany($s['company_id']) ?>" target="_blank"><?= $h($s['company']) ?></a></td>
+  <td data-v="<?= count($s['position_ids']) ?>"><?= implode(', ', array_map(fn($id) => '№' . ($num[$id] ?? $id), $s['position_ids'])) ?></td>
+  <td data-v="<?= (int)$s['wins'] ?>"><?= (int)$s['wins'] ?></td>
+  <td data-v="<?= (int)$s['offers'] ?>"><?= (int)$s['offers'] ?></td>
+  <td data-v="<?= $s['price_index'] ?? 999 ?>"><?= $s['price_index'] !== null
+        ? ($s['price_index'] <= 1.0 ? '<b style="color:#2b8a3e">лучшая</b>' : number_format($s['price_index'], 2, ',', ' '))
+        : '<span style="color:#80868e">нет цены</span>' ?></td>
+  <td data-v="<?= $d ?>"><?= $s['last'] ? ($s['last']['price'] ? $offer($s['last'])
+        : '<span style="color:#80868e">без цены · ' . $h($s['last']['date']) . '</span>'
+          . ($s['last']['request_id'] ? ' · <a href="' . $lnkRequest($s['last']['request_id']) . '" target="_blank">запрос ' . (int)$s['last']['request_id'] . '</a>' : ''))
+        : '—' ?></td>
+  <td data-v="<?= count($s['purchase_ids']) ?>"><?= implode(', ', array_map(
+        fn($id) => '<a href="' . $lnkPurchase($id) . '" target="_blank">' . (int)$id . '</a>', array_slice($s['purchase_ids'], 0, 5)))
+        . (count($s['purchase_ids']) > 5 ? ' …' : '') ?></td>
 </tr>
 <?php endforeach; ?>
 </table>
 <?php endif; ?>
+
+<?php if (!empty($r['purchases'])): ?>
+<h3>Похожие прошлые закупки</h3>
+<div class="note">Закупки, где уже были эти позиции. Порядок: <?= $h($r['sort']['purchases'] ?? '') ?>.
+Если в одной прошлой закупке совпало несколько позиций — это сильный аналог, её поставщики — первые кандидаты.</div>
+<table>
+<tr><th>Закупка</th><th>Дата</th><th>Совпали позиции</th><th>Поставщики (✓ — выбран)</th></tr>
+<?php foreach ($r['purchases'] as $g): ?>
+<tr>
+  <td><a href="<?= $lnkPurchase($g['purchase_id']) ?>" target="_blank">закупка <?= (int)$g['purchase_id'] ?></a></td>
+  <td><?= $h($g['date']) ?></td>
+  <td><?= implode('<br>', array_map(fn($id) => '№' . ($num[$id] ?? $id) . ' <span style="color:#80868e">как «'
+        . $h(implode('», «', $g['matched'][$id] ?? [])) . '»</span>', $g['position_ids'])) ?></td>
+  <td><?= implode('<br>', array_map(function ($x) use ($h, $lnkCompany, $price, $num) {
+        $name = $x['company_id'] ? '<a href="' . $lnkCompany($x['company_id']) . '" target="_blank">' . $h($x['company']) . '</a>' : $h($x['company'] ?: '—');
+        $ps = array_map(fn($o) => '№' . ($num[$o['for_position_id']] ?? '') . ' ' . $price($o['price'])
+            . ($o['price'] && $o['unit'] ? '/' . $h($o['unit']) : '') . ($o['selected'] ? ' ✓' : ''), $x['offers']);
+        return $name . ': ' . implode('; ', $ps);
+    }, $g['suppliers'])) ?></td>
+</tr>
+<?php endforeach; ?>
+</table>
+<?php endif; ?>
+<script>
+window.riaiSort = window.riaiSort || function (th, type, firstAsc) {
+    // первый клик: текст и цена — по возрастанию, остальное — по убыванию; повторный клик — наоборот
+    var table = th.closest('table'), rows = Array.prototype.slice.call(table.rows, 1), i = th.cellIndex;
+    var dir = th.dataset.dir ? (th.dataset.dir === 'asc' ? 'desc' : 'asc') : (firstAsc ? 'asc' : 'desc');
+    Array.prototype.forEach.call(th.parentNode.cells, function (c) {
+        delete c.dataset.dir; c.textContent = c.textContent.replace(/ [↑↓]$/, '');
+    });
+    th.dataset.dir = dir;
+    th.textContent += dir === 'asc' ? ' ↑' : ' ↓';
+    rows.sort(function (a, b) {
+        var x = a.cells[i].dataset.v, y = b.cells[i].dataset.v;
+        var r = type === 'num' ? parseFloat(x) - parseFloat(y) : String(x).localeCompare(String(y), 'ru');
+        return dir === 'asc' ? r : -r;
+    });
+    rows.forEach(function (row) { row.parentNode.appendChild(row); });
+};
+</script>
+<style>.riai table.riai-sort th{cursor:pointer;user-select:none}.riai table.riai-sort th:hover{color:#2067b0}</style>
 </div>
 <?php
 /* ---------- Во вкладке-компоненте (шаблон) достаточно такого кода ----------
@@ -158,7 +220,7 @@ function riaiLoad(refresh) {
   box.innerHTML = 'Загружаю подсказки…';
   BX.ajax({url: '/local/ajax/riai_advice.php?purchase=<?= (int)$purchaseId ?>' + (refresh ? '&refresh=1' : ''),
            method: 'GET', dataType: 'html', timeout: 120,
-           onsuccess: function (html) { box.innerHTML = html; },
+           onsuccess: function (html) { BX.html(box, html); },   // BX.html выполняет <script> из ответа
            onfailure: function () { box.innerHTML = 'Сервис подсказок недоступен'; }});
 }
 riaiLoad(false);
