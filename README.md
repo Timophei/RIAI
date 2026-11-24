@@ -81,9 +81,18 @@ location /supply-ai/ {
 Проверка в браузере: `https://b-integration.ru/supply-ai/preview?key=<API_KEY>&q=Соль техническая&q=Швеллер 20`
 
 ### Портал (папка `bitrix/`)
-- `RiaiAdvice.php` → `/local/php_interface/lib/`, подключить в `init.php`; задать `riai_api_key`.
-- `riai_advice_ajax.php` → `/local/ajax/riai_advice.php`. Функцию `riaiPurchasePositions()` замените
-  выборкой, которой строится вкладка «Позиции закупок». Внизу файла — JS для вставки во вкладку.
+| Файл из репозитория | Куда на портале |
+|---|---|
+| `bitrix/RiaiAdvice.php` | `/local/php_interface/lib/RiaiAdvice.php` |
+| `bitrix/init_riai.php` | `/local/php_interface/init_riai.php` + строка `require_once __DIR__ . '/init_riai.php';` в `init.php` |
+| `bitrix/riai_advice_ajax.php` | `/local/ajax/riai_advice.php` |
+
+Ключ: «Настройки → Инструменты → Командная PHP-строка»:
+`\Bitrix\Main\Config\Option::set('main', 'riai_api_key', 'API_KEY');`
+
+`init_riai.php` добавляет вкладку «Подсказки снабжения» в карточку Закупки (событие `crm:onEntityDetailsTabsInitialized`),
+вкладка при открытии грузит `/local/ajax/riai_advice.php?purchase=ID`.
+Диагностика: `/local/ajax/riai_advice.php?purchase=ID&debug=1` — какие подзаявки и позиции нашлись.
 
 ## Дальше
 - Кнопка «Создать запросы»: по запросу на поставщика + «Позиции предложения» с пустой ценой.

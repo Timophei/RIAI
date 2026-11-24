@@ -1,8 +1,8 @@
 <?php
 /**
- * AJAX-точка вкладки: /local/ajax/riai_advice.php?purchase=23504[&refresh=1]
- * Собирает позиции закупки, спрашивает сервер RIAI, рисует ответ со ссылками.
- * Вкладка (ваш компонент) просто подгружает этот HTML после открытия — см. пример JS внизу файла.
+ * Содержимое вкладки «Подсказки снабжения»: /local/ajax/riai_advice.php?purchase=23504
+ *   &refresh=1 — пересчитать без кэша;  &debug=1 — диагностика (какие подзаявки и позиции нашлись)
+ * Вкладку в карточку добавляет обработчик из init_riai.php — он и вызывает этот файл.
  */
 define('NO_KEEP_STATISTIC', true);
 require $_SERVER['DOCUMENT_ROOT'] . '/bitrix/modules/main/include/prolog_before.php';
@@ -57,6 +57,27 @@ function riaiPurchasePositions(int $purchaseId): array
 }
 
 $positions = riaiPurchasePositions($purchaseId);
+
+if (!empty($_GET['debug'])) {   // диагностика: что нашлось на каждом шаге
+    echo '<pre style="font-size:12px">';
+    $factory = Container::getInstance()->getFactory(164);
+    $subs = $factory->getItems(['select' => ['ID', 'TITLE'], 'filter' => ['=PARENT_ID_' . RIAI_PURCHASE_TYPE => $purchaseId]]);
+    echo "Подзаявки закупки {$purchaseId} (по связи «родитель»): " . count($subs) . "\n";
+    foreach ($subs as $it) echo '  ' . $it->getId() . ' ' . $it->getTitle() . "\n";
+    echo "\nПоля-привязки подзаявок:\n";
+    foreach ($factory->getFieldsCollection() as $f) {
+        if (in_array($f->getType(), ['crm', 'crm_entity'], true) || strpos($f->getName(), 'PARENT_ID_') === 0) {
+            echo '  ' . $f->getName() . ' (' . $f->getType() . ') ' . $f->getTitle() . "\n";
+        }
+    }
+    echo "\nНайдено позиций: " . count($positions) . "\n";
+    foreach (array_slice($positions, 0, 10) as $p) echo '  ' . $p['id'] . ' ' . $p['name'] . ' — ' . $p['qty'] . ' ' . $p['unit'] . "\n";
+    echo "\nКак хранится «Подзаявка» (PROPERTY_66) у последних позиций списка 15:\n";
+    $rs = CIBlockElement::GetList(['ID' => 'DESC'], ['IBLOCK_ID' => 15, '!PROPERTY_66' => false], false, ['nTopCount' => 5], ['ID', 'NAME', 'PROPERTY_66']);
+    while ($el = $rs->Fetch()) echo '  ' . $el['ID'] . ' ' . $el['NAME'] . ' → «' . $el['PROPERTY_66_VALUE'] . "»\n";
+    echo '</pre>';
+    die();
+}
 $r = RiaiAdvice::get($purchaseId, $positions, 8, !empty($_GET['refresh']));
 if (empty($r['ok'])) {
     die('<div style="color:#a0662b">' . htmlspecialcharsbx($r['error'] ?? 'Ошибка') . '</div>');
@@ -98,7 +119,14 @@ $num = [];
 .riai details summary{cursor:pointer;color:#2067b0}
 .riai .note{background:#f5f7f9;padding:8px 10px;border-radius:4px;margin-bottom:10px;color:#525c69}
 </style>
-<div class="riai">
+<div class="riai" id="riai-box-<?= $purchaseId ?>">
+<div style="margin-bottom:8px">
+  <button type="button" class="ui-btn ui-btn-light-border ui-btn-xs" onclick="(function(b){
+      var box=document.getElementById('riai-box-<?= $purchaseId ?>'); b.disabled=true; b.textContent='Обновляю…';
+      BX.ajax({url:'/local/ajax/riai_advice.php?purchase=<?= $purchaseId ?>&refresh=1', method:'GET', dataType:'html', timeout:120,
+        onsuccess:function(h){ BX.html(box.parentNode, h); }, onfailure:function(){ b.disabled=false; b.textContent='Ошибка, ещё раз'; }});
+  })(this)">Обновить подсказки</button>
+</div>
 <div class="note">Подсказки по истории закупок, данные на <?= $h($r['updated']) ?>. ✓ — предложение было выбрано.
 «≈ … ₽/кг» — цена, пересчитанная по фасовке; серым — другая единица, напрямую не сравнивать.
 «Лучшая цена» считается только среди сопоставимых единиц.</div>
@@ -211,18 +239,3 @@ window.riaiSort = window.riaiSort || function (th, type, firstAsc) {
 <style>.riai table.riai-sort th{cursor:pointer;user-select:none}.riai table.riai-sort th:hover{color:#2067b0}</style>
 </div>
 <?php
-/* ---------- Во вкладке-компоненте (шаблон) достаточно такого кода ----------
-<button type="button" class="ui-btn ui-btn-light-border ui-btn-xs" onclick="riaiLoad(true)">Обновить подсказки</button>
-<div id="riai-box">Загружаю подсказки…</div>
-<script>
-function riaiLoad(refresh) {
-  var box = document.getElementById('riai-box');
-  box.innerHTML = 'Загружаю подсказки…';
-  BX.ajax({url: '/local/ajax/riai_advice.php?purchase=<?= (int)$purchaseId ?>' + (refresh ? '&refresh=1' : ''),
-           method: 'GET', dataType: 'html', timeout: 120,
-           onsuccess: function (html) { BX.html(box, html); },   // BX.html выполняет <script> из ответа
-           onfailure: function () { box.innerHTML = 'Сервис подсказок недоступен'; }});
-}
-riaiLoad(false);
-</script>
-*/
