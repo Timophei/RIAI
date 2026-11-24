@@ -1,21 +1,21 @@
-"""Вкладка «Подсказки снабжения» в карточке Закупки (этап 2, только чтение).
+"""API подсказок снабжения для вкладки-компонента на портале.
 
 Маршруты (за nginx: https://b-integration.ru/supply-ai/...):
-  GET  /           — проверка, что сервис жив
-  POST /install    — обработчик установки локального приложения: регистрирует вкладку
-  POST /tab        — содержимое вкладки (Битрикс открывает в iframe)
-  GET  /preview    — то же без Битрикса: /preview?purchase=ID&key=PREVIEW_KEY
+  GET  /              — проверка, что сервис жив
+  POST /api/advice    — подсказки по закупке; заголовок X-Api-Key: API_KEY
+                        тело: {"purchase_id": 23504, "positions": [{"id":..,"name":..,"qty":..,"unit":..}]?}
+                        если positions не переданы — сервер сам найдёт их через подзаявки закупки
+  GET  /preview       — HTML для проверки в браузере: /preview?purchase=ID&key=API_KEY
 """
 import html
 import json
 import os
 import threading
 import time
-from urllib.parse import urlsplit
+import hmac
 
-import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from . import db
 from .b24 import B24
@@ -25,13 +25,12 @@ from .sync import position_row
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://b-integration.ru/supply-ai/").rstrip("/") + "/"
-PREVIEW_KEY = os.environ.get("PREVIEW_KEY", "")
-TAB_TITLE = os.environ.get("TAB_TITLE", "Подсказки снабжения")
-VERIFY = os.environ.get("B24_VERIFY_SSL", "1") != "0"
+API_KEY = os.environ.get("API_KEY", "")
+CACHE_SEC = int(os.environ.get("ADVICE_CACHE_SEC", "600"))
 
 _lock = threading.Lock()
 _state = {"index": None, "sync": None, "building": False, "cfg": None}
-_tokens = {}  # AUTH_ID -> время проверки
+_cache = {}  # (закупка, позиции, синхр.) -> (время, ответ)
 
 
 # ---------- данные ----------
@@ -82,15 +81,15 @@ def purchase_positions(purchase_id):
     + позиции, по которым уже есть запросы поставщику этой закупки (из локальной базы)."""
     c, b = cfg(), B24()
     st, pt = c["subrequest_entity_type_id"], c.get("purchase_entity_type_id")
-    subs = set()
+    subs, errors = set(), []
     for fld in c.get("subrequest_purchase_fields") or [f"parentId{pt}"]:
         try:
             items = b.list_all("crm.item.list", {"entityTypeId": st, "filter": {fld: purchase_id},
                                                  "select": ["id"]},
                                extract=lambda r: (r or {}).get("items", []))
             subs |= {int(i["id"]) for i in items}
-        except Exception:
-            continue
+        except Exception as ex:
+            errors.append(f"подзаявки по полю {fld}: {ex}")
     out = {}
     sub_prop = c["position_fields"].get("subrequest")
     if subs and sub_prop:
@@ -110,37 +109,59 @@ def purchase_positions(purchase_id):
             JOIN requests q ON q.id = o.request_id JOIN positions p ON p.id = o.position_id
             WHERE q.purchase_id = ?""", (purchase_id,)):
         out.setdefault(r["id"], dict(r))
+    _state["last_errors"] = errors
     return sorted(out.values(), key=lambda p: p["id"]), len(subs)
 
 
-# ---------- проверка, что запрос пришёл из Битрикса ----------
-def portal_base():
-    u = urlsplit(os.environ["B24_WEBHOOK"])
-    return f"{u.scheme}://{u.netloc}/"
+# ---------- подсказки ----------
+def _offer(o, h=None):
+    return {"supplier": o["company"] or (f"запрос #{o['request_id']}" if o["request_id"] else None),
+            "company_id": o["company_id"], "price": o["price"] if price_ok(o["price"]) else None,
+            "selected": bool(o["selected"]), "date": (o["date_create"] or "")[:10],
+            "request_id": o["request_id"], "position": h["name"] if h else None}
 
 
-def check_auth(auth_id):
-    if not auth_id:
-        return False
-    now = time.time()
-    if now - _tokens.get(auth_id, 0) < 600:
-        return True
-    try:
-        r = requests.post(portal_base() + "rest/user.current.json", data={"auth": auth_id},
-                          timeout=15, verify=VERIFY).json()
-    except Exception:
-        return False
-    if r.get("result", {}).get("ID"):
-        _tokens[auth_id] = now
-        if len(_tokens) > 5000:
-            _tokens.clear()
-        return True
-    return False
+def advise(purchase_id, positions=None):
+    """Чистые данные: по каждой позиции — у кого брали, лучшая цена, похожие закупки; сводка по поставщикам."""
+    idx = index()
+    nsubs = None
+    _state["last_errors"] = []
+    if not positions:
+        positions, nsubs = purchase_positions(purchase_id)
+    pids = {int(p["id"]) for p in positions if p.get("id") not in (None, "")}
+    out, by_sup = [], {}
+    for n, p in enumerate(positions, 1):
+        hits = idx.search(p.get("name") or "", k=8, exclude_pids=pids)
+        pairs = [(o, h) for h in hits for o in h["offers"]]
+        won = sorted([x for x in pairs if x[0]["selected"] and price_ok(x[0]["price"])],
+                     key=lambda x: _sort_date(x[0]["date_create"]), reverse=True)
+        priced = sorted([x for x in pairs if price_ok(x[0]["price"])], key=lambda x: x[0]["price"])
+        for s in supplier_summary(hits)[:5]:
+            d = by_sup.setdefault(s["supplier"], {"supplier": s["supplier"], "company_id": s["company_id"],
+                                                  "positions": [], "wins": 0, "last": None})
+            d["positions"].append(n)
+            d["wins"] += s["wins"]
+            if s["last"] and (d["last"] is None or _sort_date(s["last"][1]) > _sort_date(d["last"]["date"])):
+                d["last"] = {"price": s["last"][0], "date": s["last"][1][:10], "position": s["last"][2]}
+        out.append({
+            "n": n, "id": p.get("id"), "name": p.get("name"), "qty": p.get("qty"), "unit": p.get("unit"),
+            "status": "found" if won else "asked" if hits else "new",
+            "last": _offer(*won[0]) if won else None,
+            "best": _offer(*priced[0]) if priced else None,
+            "similar": [{"score": round(h["score"], 2), "name": h["name"], "qty": h["qty"], "unit": h["unit"],
+                         "date": (h["date"] or "")[:10],
+                         "offers": [_offer(o) for o in sorted(h["offers"], key=lambda o: (-(o["selected"] or 0),
+                                                                                         o["price"] or 1e18))[:6]]}
+                        for h in hits]})
+    sups = sorted(by_sup.values(), key=lambda d: (-len(d["positions"]), -d["wins"]))[:15]
+    return {"ok": True, "purchase_id": purchase_id, "updated": (_state["sync"] or "")[:16].replace("T", " "),
+            "subrequests_found": nsubs, "warnings": list(_state.get("last_errors") or []),
+            "positions": out, "suppliers": sups}
 
 
-# ---------- страница ----------
+# ---------- HTML-фрагмент (стили с префиксом .riai, чтобы не задеть стили Битрикса) ----------
 def fmt_price(p):
-    return f"{p:,.0f} ₽".replace(",", " ") if price_ok(p) else "—"
+    return f"{p:,.0f}\u00a0₽".replace(",", "\u00a0") if p else "—"
 
 
 def e(s):
@@ -148,122 +169,105 @@ def e(s):
 
 
 CSS = """
-body{font:13px/1.45 -apple-system,'Segoe UI',Roboto,Arial,sans-serif;color:#1f2d3d;margin:12px;background:#fff}
-h2{font-size:16px;margin:18px 0 8px}
-table{border-collapse:collapse;width:100%}
-th,td{border-bottom:1px solid #e5e9ee;padding:6px 8px;text-align:left;vertical-align:top}
-th{background:#f5f7f9;font-weight:600;color:#525c69}
-.muted{color:#80868e}.none{color:#a0662b}.win{color:#2b8a3e;font-weight:600}
-details summary{cursor:pointer;color:#2067b0}
-details table{margin:6px 0 4px;font-size:12px}
-.note{background:#f5f7f9;padding:8px 10px;border-radius:4px;margin-bottom:10px}
-.tag{display:inline-block;background:#eef2f4;border-radius:3px;padding:0 5px;margin:1px 2px 1px 0;font-size:12px}
+.riai{font:13px/1.45 -apple-system,'Segoe UI',Roboto,Arial,sans-serif;color:#1f2d3d}
+.riai h3{font-size:15px;margin:18px 0 8px}
+.riai table{border-collapse:collapse;width:100%;background:#fff}
+.riai th,.riai td{border-bottom:1px solid #e5e9ee;padding:6px 8px;text-align:left;vertical-align:top}
+.riai th{background:#f5f7f9;font-weight:600;color:#525c69}
+.riai .muted{color:#80868e}.riai .none{color:#a0662b}.riai .win{color:#2b8a3e;font-weight:600}
+.riai details summary{cursor:pointer;color:#2067b0}
+.riai details table{margin:6px 0 4px;font-size:12px}
+.riai .note{background:#f5f7f9;padding:8px 10px;border-radius:4px;margin-bottom:10px}
+.riai .tag{display:inline-block;background:#eef2f4;border-radius:3px;padding:0 5px;margin:1px 2px 1px 0;font-size:12px}
 """
 
 
-def render(purchase_id):
-    idx = index()
-    positions, nsubs = purchase_positions(purchase_id)
-    pids = {p["id"] for p in positions}
-    rows, by_supplier = [], {}
-    for n, p in enumerate(positions, 1):
-        hits = idx.search(p["name"], k=8, exclude_pids=pids)
-        offers = [(o, h) for h in hits for o in h["offers"]]
-        won = sorted([x for x in offers if x[0]["selected"] and price_ok(x[0]["price"])],
-                     key=lambda x: _sort_date(x[0]["date_create"]), reverse=True)
-        priced = sorted([x for x in offers if price_ok(x[0]["price"])], key=lambda x: x[0]["price"])
-        for s in supplier_summary(hits)[:5]:
-            d = by_supplier.setdefault(s["supplier"], {"pos": [], "wins": 0, "last": None})
-            d["pos"].append(n)
-            d["wins"] += s["wins"]
-            if s["last"] and (d["last"] is None or _sort_date(s["last"][1]) > _sort_date(d["last"][1])):
-                d["last"] = s["last"]
-        last = (f'<span class="win">{e(won[0][0]["company"] or "—")}</span><br>{fmt_price(won[0][0]["price"])}'
-                f' <span class="muted">· {e((won[0][0]["date_create"] or "")[:10])} · {e(won[0][1]["name"])}</span>'
-                if won else '<span class="none">не закупали</span>' if not hits else
-                '<span class="muted">похожее запрашивали, но без выбора</span>')
-        best = (f'{e(priced[0][0]["company"] or "—")}<br>{fmt_price(priced[0][0]["price"])}'
-                f' <span class="muted">· {e((priced[0][0]["date_create"] or "")[:10])}</span>' if priced else "—")
-        detail = ""
-        if hits:
+def to_html(d):
+    def offer_cell(o, with_pos=True):
+        if not o:
+            return "—"
+        return (f'<span class="win">{e(o["supplier"] or "—")}</span><br>{fmt_price(o["price"])} '
+                f'<span class="muted">· {e(o["date"])}' + (f' · {e(o["position"])}' if with_pos and o["position"] else "") +
+                "</span>")
+    rows = []
+    for p in d["positions"]:
+        sim = ""
+        if p["similar"]:
             trs = "".join(
                 f'<tr><td>{h["score"]:.2f}</td><td>{e(h["name"])} <span class="muted">({e(h["qty"])} {e(h["unit"])})</span></td>'
-                f'<td>{e((h["date"] or "")[:10])}</td><td>' +
-                "; ".join(f'{e(o["company"] or "запрос #%s" % o["request_id"])}: {fmt_price(o["price"])}'
-                          f'{" ✓" if o["selected"] else ""}'
-                          for o in sorted(h["offers"], key=lambda o: (-(o["selected"] or 0), o["price"] or 1e18))[:6]) +
-                "</td></tr>" for h in hits)
-            detail = (f'<details><summary>похожие закупки: {len(hits)}</summary><table><tr><th>Похож.</th>'
-                      f'<th>Позиция</th><th>Дата</th><th>Предложения (✓ — выбран)</th></tr>{trs}</table></details>')
-        rows.append(f'<tr><td>{n}</td><td>{e(p["name"])}{detail}</td><td>{e(p["qty"])} {e(p["unit"])}</td>'
-                    f'<td>{last}</td><td>{best}</td></tr>')
-
-    sup = sorted(by_supplier.items(), key=lambda kv: (-len(kv[1]["pos"]), -kv[1]["wins"]))[:15]
-    sup_rows = "".join(
-        f'<tr><td>{e(k)}</td><td>{"".join(f"<span class=tag>№{i}</span>" for i in v["pos"])}</td>'
-        f'<td>{v["wins"]}</td><td>' +
-        (f'{fmt_price(v["last"][0])} <span class="muted">· {e(v["last"][1][:10])} · {e(v["last"][2])}</span>'
-         if v["last"] else "—") + "</td></tr>" for k, v in sup)
-
-    if not positions:
-        body = (f'<div class="note">Позиции этой закупки не найдены (подзаявок: {nsubs}). '
-                f'Если позиции точно есть — сообщите ID закупки разработчику.</div>')
+                f'<td>{e(h["date"])}</td><td>' +
+                "; ".join(f'{e(o["supplier"] or "—")}: {fmt_price(o["price"])}{" ✓" if o["selected"] else ""}'
+                          for o in h["offers"]) + "</td></tr>" for h in p["similar"])
+            sim = (f'<details><summary>похожие закупки: {len(p["similar"])}</summary><table><tr><th>Похож.</th>'
+                   f'<th>Позиция</th><th>Дата</th><th>Предложения (✓ — выбран)</th></tr>{trs}</table></details>')
+        last = (offer_cell(p["last"]) if p["last"] else
+                '<span class="none">не закупали</span>' if p["status"] == "new" else
+                '<span class="muted">похожее запрашивали, без выбора</span>')
+        rows.append(f'<tr><td>{p["n"]}</td><td>{e(p["name"])}{sim}</td><td>{e(p["qty"])} {e(p["unit"])}</td>'
+                    f'<td>{last}</td><td>{offer_cell(p["best"], False)}</td></tr>')
+    sup = "".join(
+        f'<tr><td>{e(s["supplier"])}</td><td>{"".join(f"<span class=tag>№{i}</span>" for i in s["positions"])}</td>'
+        f'<td>{s["wins"]}</td><td>' +
+        (f'{fmt_price(s["last"]["price"])} <span class="muted">· {e(s["last"]["date"])} · {e(s["last"]["position"])}</span>'
+         if s["last"] else "—") + "</td></tr>" for s in d["suppliers"])
+    if not d["positions"]:
+        body = (f'<div class="note">Позиции закупки не найдены'
+                f'{" (подзаявок: %s)" % d["subrequests_found"] if d["subrequests_found"] is not None else ""}.</div>')
     else:
-        body = (f'<h2>Позиции закупки ({len(positions)})</h2><table><tr><th>№</th><th>Позиция</th><th>Кол-во</th>'
+        body = (f'<h3>Позиции ({len(d["positions"])})</h3><table><tr><th>№</th><th>Позиция</th><th>Кол-во</th>'
                 f'<th>Брали в последний раз</th><th>Лучшая цена в истории</th></tr>{"".join(rows)}</table>'
-                f'<h2>Кому отправить запросы</h2>' +
+                f'<h3>Кому отправить запросы</h3>' +
                 (f'<table><tr><th>Поставщик</th><th>Какие позиции закрывает</th><th>Выбирали раз</th>'
-                 f'<th>Последняя цена</th></tr>{sup_rows}</table>' if sup_rows else
+                 f'<th>Последняя цена</th></tr>{sup}</table>' if sup else
                  '<div class="note">По истории предложить некого — позиции новые.</div>'))
-    upd = idx and _state["sync"]
-    return (f'<!doctype html><html><head><meta charset="utf-8"><style>{CSS}</style></head><body>'
-            f'<div class="note">Подсказки по истории закупок. Данные обновлены: {e((upd or "")[:16].replace("T", " "))}. '
-            f'Цены — за единицу из прошлой закупки, сверяйте единицы.</div>{body}</body></html>')
+    warn = "".join(f'<div class="note none">⚠ {e(w)}</div>' for w in d.get("warnings") or [])
+    return (f'<style>{CSS}</style><div class="riai">{warn}<div class="note">Подсказки по истории закупок, '
+            f'данные на {e(d["updated"])}. Цены — за единицу из прошлой закупки, сверяйте единицы.</div>{body}</div>')
 
 
 # ---------- маршруты ----------
+def key_ok(k):
+    return bool(API_KEY) and hmac.compare_digest(k or "", API_KEY)
+
+
 @app.get("/", response_class=PlainTextResponse)
 def health():
     return "RIAI: сервис подсказок снабжения работает"
 
 
-@app.api_route("/tab", methods=["GET", "POST"], response_class=HTMLResponse)
-async def tab(request: Request):
-    form = dict(await request.form()) if request.method == "POST" else {}
-    if not check_auth(form.get("AUTH_ID")):
-        return HTMLResponse("Нет доступа: откройте вкладку из карточки закупки в Битрикс24.", status_code=403)
+@app.post("/api/advice")
+async def api_advice(request: Request):
+    if not key_ok(request.headers.get("x-api-key")):
+        return JSONResponse({"ok": False, "error": "bad api key"}, status_code=403)
     try:
-        pid = int(json.loads(form.get("PLACEMENT_OPTIONS") or "{}").get("ID"))
-    except (TypeError, ValueError):
-        return HTMLResponse("Не передан ID закупки", status_code=400)
-    return render(pid)
+        body = await request.json()
+        pid = int(body.get("purchase_id"))
+    except Exception:
+        return JSONResponse({"ok": False, "error": "нужен JSON с purchase_id"}, status_code=400)
+    positions = body.get("positions") or None
+    fmt = body.get("format", "both")
+    ck = (pid, json.dumps(positions, sort_keys=True, ensure_ascii=False), _state["sync"])
+    hit = _cache.get(ck)
+    if hit and time.time() - hit[0] < CACHE_SEC and not body.get("refresh"):
+        d = hit[1]
+    else:
+        try:
+            d = advise(pid, positions)
+        except Exception as ex:
+            return JSONResponse({"ok": False, "error": f"{type(ex).__name__}: {ex}"}, status_code=500)
+        if len(_cache) > 500:
+            _cache.clear()
+        _cache[ck] = (time.time(), d)
+    res = dict(d)
+    if fmt in ("html", "both"):
+        res["html"] = to_html(d)
+    if fmt == "html":
+        res = {"ok": True, "html": res["html"]}
+    return JSONResponse(res)
 
 
 @app.get("/preview", response_class=HTMLResponse)
 def preview(purchase: int, key: str = ""):
-    if not PREVIEW_KEY or key != PREVIEW_KEY:
+    if not key_ok(key):
         return HTMLResponse("Нет доступа", status_code=403)
-    return render(purchase)
-
-
-@app.api_route("/install", methods=["GET", "POST"], response_class=HTMLResponse)
-async def install(request: Request):
-    form = dict(await request.form()) if request.method == "POST" else {}
-    auth = form.get("AUTH_ID") or request.query_params.get("AUTH_ID")
-    if not check_auth(auth):
-        return HTMLResponse("Установка возможна только из Битрикс24", status_code=403)
-    placement = f'CRM_DYNAMIC_{cfg()["purchase_entity_type_id"]}_DETAIL_TAB'
-    base = portal_base() + "rest/"
-    requests.post(base + "placement.unbind.json",
-                  data={"auth": auth, "PLACEMENT": placement, "HANDLER": PUBLIC_URL + "tab"},
-                  timeout=15, verify=VERIFY)
-    r = requests.post(base + "placement.bind.json",
-                      data={"auth": auth, "PLACEMENT": placement, "HANDLER": PUBLIC_URL + "tab",
-                            "TITLE": TAB_TITLE}, timeout=15, verify=VERIFY).json()
-    ok = bool(r.get("result"))
-    msg = (f"Вкладка «{e(TAB_TITLE)}» добавлена в карточку закупки ({placement})." if ok else
-           f"Ошибка регистрации вкладки: {e(r.get('error'))} {e(r.get('error_description'))}")
-    return (f'<!doctype html><html><head><meta charset="utf-8">'
-            f'<script src="//api.bitrix24.com/api/v1/"></script></head><body style="font:14px sans-serif">'
-            f'<p>{msg}</p><script>if(window.BX24){{BX24.init(function(){{BX24.installFinish();}});}}</script>'
-            f'</body></html>')
+    return f'<!doctype html><meta charset="utf-8"><body style="margin:12px">{to_html(advise(purchase))}</body>'
