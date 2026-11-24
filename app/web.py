@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from . import db
 from .discover import CONFIG
 from .search import Index, price_ok, _sort_date
+from .units import basis, unit_price, label
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://b-integration.ru/supply-ai/").rstrip("/") + "/"
@@ -54,13 +55,19 @@ def index():
 
 
 # ---------- подсказки ----------
-def _offer(o):
-    """Предложение из истории со всеми ID, по которым портал строит ссылки."""
+def _offer(o, want=None):
+    """Предложение из истории со всеми ID, по которым портал строит ссылки.
+    unit — единица той позиции; unit_price — цена за базовую единицу (кг, л, м…), если её можно вычислить;
+    comparable — та же базовая единица, что у запрошенной позиции (цены можно сравнивать)."""
+    price = o["price"] if price_ok(o["price"]) else None
+    up, base = unit_price(price, o["name"], o.get("unit"), o.get("weight"))
     return {"offer_id": o["id"], "position_id": o["position_id"], "position": o["name"],
             "company_id": o["company_id"], "company": o["company"],
             "request_id": o["request_id"], "purchase_id": o["purchase_id"],
-            "price": o["price"] if price_ok(o["price"]) else None, "selected": bool(o["selected"]),
-            "date": (o["date_create"] or "")[:10]}
+            "price": price, "unit": o.get("unit"),
+            "unit_price": round(up, 2) if up is not None else None, "base_unit": label(base),
+            "comparable": bool(want and base == want),
+            "selected": bool(o["selected"]), "date": (o["date_create"] or "")[:10]}
 
 
 def advise(purchase_id, positions, k=8):
@@ -76,11 +83,14 @@ def advise(purchase_id, positions, k=8):
             pass
     out, by_sup = [], {}
     for p in positions:
+        want, _ = basis(p.get("name"), p.get("unit"), p.get("weight"))
         hits = idx.search(p.get("name") or "", k=k, exclude_purchase=purchase_id, exclude_pids=pids)
         offers = [o for h in hits for o in h["offers"]]
         won = sorted([o for o in offers if o["selected"] and price_ok(o["price"])],
                      key=lambda o: _sort_date(o["date_create"]), reverse=True)
-        priced = sorted([o for o in offers if price_ok(o["price"])], key=lambda o: o["price"])
+        # лучшая цена — только среди сопоставимых единиц, по цене за базовую единицу
+        priced = sorted([x for x in ((_offer(o, want), o) for o in offers if price_ok(o["price"]))
+                         if x[0]["comparable"]], key=lambda x: x[0]["unit_price"])
         for o in offers:
             if not o["company_id"]:
                 continue
@@ -92,17 +102,18 @@ def advise(purchase_id, positions, k=8):
             d["wins"] += 1 if o["selected"] else 0
             if price_ok(o["price"]) and (d["last"] is None or
                                          _sort_date(o["date_create"]) > _sort_date(d["last"]["date"])):
-                d["last"] = _offer(o)
+                d["last"] = _offer(o, want)
         out.append({
             "id": p.get("id"), "name": p.get("name"), "qty": p.get("qty"), "unit": p.get("unit"),
+            "base_unit": label(want),
             "status": "found" if won else "asked" if hits else "new",   # брали / только запрашивали / не было
-            "last_selected": _offer(won[0]) if won else None,
-            "best_price": _offer(priced[0]) if priced else None,
+            "last_selected": _offer(won[0], want) if won else None,
+            "best_price": priced[0][0] if priced else None,
             "matches": [{"position_id": h["position_id"], "name": h["name"], "qty": h["qty"], "unit": h["unit"],
                          "score": round(h["score"], 2), "date": (h["date"] or "")[:10],
                          "purchase_ids": h["purchase_ids"],
-                         "offers": [_offer(o) for o in sorted(h["offers"], key=lambda o: (-(o["selected"] or 0),
-                                                                                           o["price"] or 1e18))]}
+                         "offers": [_offer(o, want) for o in sorted(h["offers"], key=lambda o: (-(o["selected"] or 0),
+                                                                                                 o["price"] or 1e18))]}
                         for h in hits]})
     sups = sorted(by_sup.values(), key=lambda d: (-len(d["position_ids"]), -d["wins"], -d["offers"]))[:20]
     return {"ok": True, "purchase_id": purchase_id,
@@ -165,7 +176,12 @@ def to_html(d):
             refs.append(f'<a href="{L["purchase"](o["purchase_id"])}" target="_blank">закупка {o["purchase_id"]}</a>')
         if o["request_id"]:
             refs.append(f'<a href="{L["request"](o["request_id"])}" target="_blank">запрос {o["request_id"]}</a>')
-        return (f'{comp} {fmt_price(o["price"])}{" ✓" if o["selected"] else ""} '
+        price = fmt_price(o["price"]) + (f'/{e(o["unit"])}' if o["unit"] and o["price"] else "")
+        if o["unit_price"] and o["base_unit"] and not o["base_unit"] == (o["unit"] or "").rstrip("."):
+            price += f' <span class="muted">≈ {o["unit_price"]:,.2f} ₽/{e(o["base_unit"])}</span>'.replace(",", " ")
+        if not o["comparable"]:
+            price = f'<span class="muted" title="другая единица — не сравнивать напрямую">{price}</span>'
+        return (f'{comp} {price}{" ✓" if o["selected"] else ""} '
                 f'<span class="muted">· {e(o["date"])} · {" · ".join(refs)}</span>')
 
     rows = []

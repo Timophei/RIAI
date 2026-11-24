@@ -46,11 +46,12 @@ function riaiPurchasePositions(int $purchaseId): array
         $values[] = $id;
     }
     $res = CIBlockElement::GetList(['ID' => 'ASC'], ['IBLOCK_ID' => 15, 'PROPERTY_66' => $values], false, false,
-        ['ID', 'NAME', 'PROPERTY_60', 'PROPERTY_89']);
+        ['ID', 'NAME', 'PROPERTY_60', 'PROPERTY_89', 'PROPERTY_111']);
     $out = [];
     while ($el = $res->Fetch()) {
         $out[$el['ID']] = ['id' => (int)$el['ID'], 'name' => $el['NAME'],
-                           'qty' => $el['PROPERTY_60_VALUE'], 'unit' => $el['PROPERTY_89_VALUE']];
+                           'qty' => $el['PROPERTY_60_VALUE'], 'unit' => $el['PROPERTY_89_VALUE'],
+                           'weight' => $el['PROPERTY_111_VALUE']];   // «Вес за ед.» — для пересчёта в ₽/кг
     }
     return array_values($out);
 }
@@ -75,7 +76,15 @@ $offer = function ($o, $bold = false) use ($h, $lnkCompany, $lnkRequest, $lnkPur
     $refs = [];
     if ($o['purchase_id']) $refs[] = '<a href="' . $lnkPurchase($o['purchase_id']) . '" target="_blank">закупка ' . (int)$o['purchase_id'] . '</a>';
     if ($o['request_id'])  $refs[] = '<a href="' . $lnkRequest($o['request_id']) . '" target="_blank">запрос ' . (int)$o['request_id'] . '</a>';
-    return $c . ' ' . $price($o['price']) . ($o['selected'] ? ' ✓' : '')
+    // цена за единицу той позиции + пересчёт за базовую (кг/л/м), если единицы отличаются
+    $pr = $price($o['price']) . ($o['price'] && $o['unit'] ? '/' . $h($o['unit']) : '');
+    if ($o['unit_price'] && $o['base_unit'] && $o['base_unit'] !== rtrim((string)$o['unit'], '.')) {
+        $pr .= ' <span style="color:#80868e">≈ ' . number_format($o['unit_price'], 2, ',', ' ') . ' ₽/' . $h($o['base_unit']) . '</span>';
+    }
+    if (empty($o['comparable'])) {   // другая единица — цену напрямую не сравнивать
+        $pr = '<span style="color:#80868e" title="Другая единица измерения — цены напрямую не сравнивать">' . $pr . '</span>';
+    }
+    return $c . ' ' . $pr . ($o['selected'] ? ' ✓' : '')
         . ' <span style="color:#80868e">· ' . $h($o['date']) . ($refs ? ' · ' . implode(' · ', $refs) : '') . '</span>';
 };
 $num = [];
@@ -90,7 +99,9 @@ $num = [];
 .riai .note{background:#f5f7f9;padding:8px 10px;border-radius:4px;margin-bottom:10px;color:#525c69}
 </style>
 <div class="riai">
-<div class="note">Подсказки по истории закупок, данные на <?= $h($r['updated']) ?>. ✓ — предложение было выбрано. Цены — за единицу из прошлой закупки.</div>
+<div class="note">Подсказки по истории закупок, данные на <?= $h($r['updated']) ?>. ✓ — предложение было выбрано.
+«≈ … ₽/кг» — цена, пересчитанная по фасовке; серым — другая единица, напрямую не сравнивать.
+«Лучшая цена» считается только среди сопоставимых единиц.</div>
 <h3>Позиции</h3>
 <table>
 <tr><th>№</th><th>Позиция</th><th>Кол-во</th><th>Последний раз выбрали</th><th>Лучшая цена в истории</th></tr>

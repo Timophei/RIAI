@@ -8,7 +8,11 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 from . import db
 
+import os
+
 NOT_FOUND = 0.45  # ниже — считаем, что ничего похожего не закупали
+# совпадения слабее RELATIVE × лучшее отбрасываем: «Соль техническая» не тянет за собой «Соль пищевую» с 0.5
+RELATIVE = float(os.environ.get("MATCH_RELATIVE", "0.6"))
 
 
 def norm(s):
@@ -72,8 +76,10 @@ class Index:
             return []
         sims = (self.X @ self.vec.transform([norm(query)]).T).toarray().ravel()
         out = []
-        for i in sims.argsort()[::-1]:
-            if sims[i] < NOT_FOUND or len(out) >= k:
+        order = sims.argsort()[::-1]
+        floor = max(NOT_FOUND, RELATIVE * float(sims[order[0]])) if len(order) else NOT_FOUND
+        for i in order:
+            if sims[i] < floor or len(out) >= k:
                 break
             pos = self._load(self.pids[i])
             for p in sorted(pos.values(), key=lambda p: _sort_date(p["date"]), reverse=True):
