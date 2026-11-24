@@ -1,11 +1,25 @@
 services:
   app:
     build: .
-    image: supply-ai:stage1
+    image: supply-ai:stage2
     env_file: .env
     volumes:
       - ./data:/data
     # Ограничения, чтобы сервис не мог занять весь сервер
     mem_limit: ${RIAI_MEM:-700m}
     memswap_limit: ${RIAI_MEM:-700m}
+    cpus: 1.0
+
+  web:
+    image: supply-ai:stage2
+    depends_on: [app]
+    env_file: .env
+    volumes:
+      - ./data:/data
+    entrypoint: ["uvicorn", "app.web:app", "--host", "0.0.0.0", "--port", "8090", "--proxy-headers"]
+    ports:
+      - "127.0.0.1:8090:8090"   # наружу только через nginx
+    restart: unless-stopped
+    mem_limit: ${RIAI_WEB_MEM:-700m}
+    memswap_limit: ${RIAI_WEB_MEM:-700m}
     cpus: 1.0

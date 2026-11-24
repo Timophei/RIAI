@@ -65,7 +65,7 @@ class Index:
             p["date"] = min((o["date_create"] or "" for o in p["offers"]), key=_sort_date)
         return pos
 
-    def search(self, query, k=10, exclude_purchase=None):
+    def search(self, query, k=10, exclude_purchase=None, exclude_pids=()):
         if self.X is None:
             return []
         sims = (self.X @ self.vec.transform([norm(query)]).T).toarray().ravel()
@@ -75,7 +75,7 @@ class Index:
                 break
             pos = self._load(self.pids[i])
             for p in sorted(pos.values(), key=lambda p: _sort_date(p["date"]), reverse=True):
-                if exclude_purchase and p["purchase_id"] == exclude_purchase:
+                if (exclude_purchase and p["purchase_id"] == exclude_purchase) or p["position_id"] in exclude_pids:
                     continue
                 if len(out) < k:
                     out.append(dict(p, score=float(sims[i])))
@@ -89,12 +89,13 @@ def _sort_date(s):
 
 def supplier_summary(hits):
     """Кто поставлял найденное: число предложений, побед, последняя и минимальная цена."""
-    agg = defaultdict(lambda: {"offers": 0, "wins": 0, "prices": [], "last": None, "rank": 0.0})
+    agg = defaultdict(lambda: {"company_id": None, "offers": 0, "wins": 0, "prices": [], "last": None, "rank": 0.0})
     for h in hits:
         for o in h["offers"]:
             name = o["company"] or (f"компания #{o['company_id']}" if o["company_id"] else
                                     f"запрос #{o['request_id']} (без компании)")
             a = agg[name]
+            a["company_id"] = o["company_id"]
             a["offers"] += 1
             a["wins"] += o["selected"] or 0
             a["rank"] += h["score"] * (1 + 2 * (o["selected"] or 0) + (1 if price_ok(o["price"]) else 0))

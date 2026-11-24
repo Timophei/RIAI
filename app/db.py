@@ -22,10 +22,11 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
 
-def connect():
+def connect(threads=False):
     os.makedirs(DATA, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, check_same_thread=not threads, timeout=30)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")  # чтение вкладкой не мешает синхронизации и наоборот
     con.executescript(SCHEMA)
     return con
 
