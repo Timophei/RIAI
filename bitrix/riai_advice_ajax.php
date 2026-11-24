@@ -1,6 +1,7 @@
 <?php
 /**
- * Содержимое вкладки «Подсказки снабжения»: /local/ajax/riai_advice.php?purchase=23504
+ * Содержимое вкладки «Подсказки снабжения»: /local/ajax/riai_advice.php?purchase=34187
+ *   purchase — ID элемента закупки (из адреса карточки /crm/type/132/details/34187/), не номер в названии
  *   &refresh=1 — пересчитать без кэша;  &debug=1 — диагностика (какие подзаявки и позиции нашлись)
  * Вкладку в карточку добавляет обработчик из init_riai.php — он и вызывает этот файл.
  */
@@ -20,9 +21,34 @@ if (!$USER->IsAuthorized() || !Loader::includeModule('crm') || !Loader::includeM
     http_response_code(403);
     die('Нет доступа');
 }
-if (!Container::getInstance()->getUserPermissions()->checkReadPermissions(RIAI_PURCHASE_TYPE, $purchaseId)) {
+// Ошибки — текстом во вкладку, а не пустой экран
+set_exception_handler(function (\Throwable $e) {
+    echo '<div style="color:#a0662b">Ошибка вкладки подсказок: ' . htmlspecialcharsbx($e->getMessage())
+        . ' <span style="color:#80868e">(' . htmlspecialcharsbx(basename($e->getFile())) . ':' . $e->getLine() . ')</span></div>';
+});
+register_shutdown_function(function () {
+    $e = error_get_last();
+    if ($e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        echo '<div style="color:#a0662b">Ошибка вкладки подсказок: ' . htmlspecialcharsbx($e['message'])
+            . ' (' . htmlspecialcharsbx(basename($e['file'])) . ':' . $e['line'] . ')</div>';
+    }
+});
+
+// Права на чтение закупки (в разных версиях Битрикса метод называется по-разному)
+$perms = Container::getInstance()->getUserPermissions();
+if (method_exists($perms, 'item')) {
+    $canRead = $perms->item()->canRead(RIAI_PURCHASE_TYPE, $purchaseId);
+} elseif (method_exists($perms, 'checkReadPermissions')) {
+    $canRead = $perms->checkReadPermissions(RIAI_PURCHASE_TYPE, $purchaseId);
+} else {
+    $canRead = true;
+}
+if (!$canRead) {
     http_response_code(403);
     die('Нет доступа к закупке');
+}
+if (!class_exists('RiaiAdvice')) {
+    die('<div style="color:#a0662b">Не подключён RiaiAdvice.php — проверьте init_riai.php и папку lib/</div>');
 }
 
 /**
