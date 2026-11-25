@@ -254,13 +254,6 @@ $box = 'riai-box-' . $purchaseId;
   <?php endforeach; ?>
 </tr>
 <?php endforeach; ?>
-<tr class="sep">
-  <td colspan="3"><b>Итого по закупке</b><div class="riai-muted riai-small">кол-во × цена, где цену можно сравнить</div></td>
-  <?php foreach ($cols as $s): ?>
-  <td class="c"><?= $s['total'] !== null ? '<b>' . $money($s['total']) . ' ₽</b>' : '<span class="riai-muted">—</span>' ?>
-    <div class="riai-muted riai-small">позиций с ценой: <?= (int)$s['total_covered'] ?> из <?= count($r['positions']) ?></div></td>
-  <?php endforeach; ?>
-</tr>
 <tr>
   <td colspan="3">Где была эта цена</td>
   <?php foreach ($cols as $s): ?>
