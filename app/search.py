@@ -53,7 +53,7 @@ class Index:
         rows = self.con.execute(f"""
             SELECT o.id, o.position_id, COALESCE(p.name, o.name) AS name, o.price, o.selected,
                    o.comment, o.date_create, o.request_id, r.company_id, c.title AS company,
-                   r.purchase_id AS purchase_id, p.unit, p.qty, p.weight, p.status
+                   r.purchase_id AS purchase_id, r.title AS request_title, p.unit, p.qty, p.weight, p.status
             FROM offers o
             LEFT JOIN positions p ON p.id = o.position_id
             LEFT JOIN requests r ON r.id = o.request_id

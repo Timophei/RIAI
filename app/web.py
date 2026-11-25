@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from . import db
 from .discover import CONFIG
 from .search import Index, price_ok, _sort_date
-from .units import basis, unit_price, label
+from .units import basis, unit_price, label, to_float
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://b-integration.ru/supply-ai/").rstrip("/") + "/"
@@ -63,7 +63,8 @@ def _offer(o, want=None):
     up, base = unit_price(price, o["name"], o.get("unit"), o.get("weight"))
     return {"offer_id": o["id"], "position_id": o["position_id"], "position": o["name"],
             "company_id": o["company_id"], "company": o["company"],
-            "request_id": o["request_id"], "purchase_id": o["purchase_id"],
+            "request_id": o["request_id"], "request_title": o.get("request_title"),
+            "purchase_id": o["purchase_id"],
             "price": price, "unit": o.get("unit"),
             "unit_price": round(up, 2) if up is not None else None, "base_unit": label(base),
             "comparable": bool(want and base == want),
@@ -96,6 +97,19 @@ def advise(purchase_id, positions, k=8):
         if priced:
             best_up[pid_cur] = priced[0][0]["unit_price"]
         for h in hits:
+            # «давал лучшую цену»: в каждой прошлой позиции (одном конкурсе) — у кого минимальная цена
+            ph = [o for o in h["offers"] if price_ok(o["price"]) and o["company_id"]]
+            if len({o["company_id"] for o in ph}) > 1:   # конкурс — только если цен было хотя бы две
+                low = min(o["price"] for o in ph)
+                for o in ph:
+                    d = by_sup.get(o["company_id"])
+                    if d is None:
+                        d = by_sup.setdefault(o["company_id"], {
+                            "company_id": o["company_id"], "company": o["company"], "position_ids": [],
+                            "offers": 0, "wins": 0, "relevance": 0.0, "last": None, "purchase_ids": [],
+                            "best_count": 0, "priced_count": 0, "cells": {}, "_best": {}, "_rel": {}})
+                    d["priced_count"] += 1
+                    d["best_count"] += 1 if o["price"] == low else 0
             for o in h["offers"]:
                 of = _offer(o, want)
                 # --- поставщики ---
@@ -103,7 +117,7 @@ def advise(purchase_id, positions, k=8):
                     d = by_sup.setdefault(o["company_id"], {
                         "company_id": o["company_id"], "company": o["company"], "position_ids": [],
                         "offers": 0, "wins": 0, "relevance": 0.0, "last": None, "purchase_ids": [],
-                        "_best": {}, "_rel": {}})
+                        "best_count": 0, "priced_count": 0, "cells": {}, "_best": {}, "_rel": {}})
                     if pid_cur not in d["position_ids"]:
                         d["position_ids"].append(pid_cur)
                     d["offers"] += 1
@@ -115,6 +129,11 @@ def advise(purchase_id, positions, k=8):
                     if d["last"] is None or (_sort_date(of["date"]), of["price"] is not None) > \
                             (_sort_date(d["last"]["date"]), d["last"]["price"] is not None):
                         d["last"] = of
+                    # ячейка матрицы: самое свежее предложение с ценой, сопоставимое — в приоритете
+                    cell = d["cells"].get(str(pid_cur))
+                    rank = (of["price"] is not None, of["comparable"], _sort_date(of["date"]))
+                    if cell is None or rank > (cell["price"] is not None, cell["comparable"], _sort_date(cell["date"])):
+                        d["cells"][str(pid_cur)] = of
                     if of["comparable"] and of["unit_price"] is not None:
                         cur = d["_best"].get(pid_cur)
                         if cur is None or of["unit_price"] < cur:
@@ -155,6 +174,17 @@ def advise(purchase_id, positions, k=8):
         d["price_index"] = round(sum(ratios) / len(ratios), 2) if ratios else None
         d["relevance"] = round(sum(d.pop("_rel").values()), 2)
         d["last_date"] = d["last"]["date"] if d["last"] else ""
+        # итог по закупке: Σ кол-во × цена за ед. по позициям, где цена сопоставима
+        total, covered = 0.0, 0
+        for p in positions:
+            c = d["cells"].get(str(p.get("id")))
+            q = to_float(p.get("qty"))
+            if c and c["comparable"] and c["unit_price"] is not None and q:
+                b, factor = basis(p.get("name"), p.get("unit"), p.get("weight"))
+                total += c["unit_price"] * factor * q
+                covered += 1
+        d["total"] = round(total, 2) if covered else None
+        d["total_covered"] = covered
         sups.append(d)
     # Порядок по умолчанию: больше позиций этой закупки → чаще выбирали → ближе по смыслу → свежее
     sups.sort(key=lambda d: (-len(d["position_ids"]), -d["wins"], -d["relevance"],

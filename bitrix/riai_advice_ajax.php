@@ -13,6 +13,10 @@ use Bitrix\Main\Loader;
 
 const RIAI_PURCHASE_TYPE = 132;   // Закупки
 const RIAI_REQUEST_TYPE  = 183;   // Запрос поставщику
+const RIAI_COLUMNS       = 6;     // сколько поставщиков показывать столбцами в матрице
+// Создавать ли вместе с запросом «Позиции предложения» (список 20) с пустой ценой по всем позициям закупки.
+// Включите, если сейчас их заводят вручную; не включайте, если их уже создаёт бизнес-процесс.
+const RIAI_CREATE_OFFER_ROWS = false;
 
 header('Content-Type: text/html; charset=UTF-8');
 global $USER;
@@ -84,6 +88,58 @@ function riaiPurchasePositions(int $purchaseId): array
 
 $positions = riaiPurchasePositions($purchaseId);
 
+// ---------- уже созданные запросы поставщикам этой закупки: компания => запрос ----------
+function riaiExistingRequests(int $purchaseId): array
+{
+    $out = [];
+    $f = Container::getInstance()->getFactory(RIAI_REQUEST_TYPE);
+    foreach ($f->getItems(['select' => ['ID', 'TITLE', 'COMPANY_ID'],
+                           'filter' => ['=PARENT_ID_' . RIAI_PURCHASE_TYPE => $purchaseId]]) as $it) {
+        if ($it->getCompanyId()) {
+            $out[(int)$it->getCompanyId()] = ['id' => $it->getId(), 'title' => $it->getTitle()];
+        }
+    }
+    return $out;
+}
+
+// ---------- действие: создать запрос поставщику ----------
+if (($_POST['action'] ?? '') === 'create_request') {
+    header('Content-Type: application/json; charset=UTF-8');
+    $companyId = (int)($_POST['company'] ?? 0);
+    if (!check_bitrix_sessid() || $companyId <= 0) {
+        die(json_encode(['ok' => false, 'error' => 'Сессия устарела, обновите страницу']));
+    }
+    $exists = riaiExistingRequests($purchaseId);
+    if (isset($exists[$companyId])) {
+        die(json_encode(['ok' => true, 'id' => $exists[$companyId]['id'], 'existed' => true,
+                         'url' => '/crm/type/' . RIAI_REQUEST_TYPE . '/details/' . $exists[$companyId]['id'] . '/']));
+    }
+    $company = \Bitrix\Crm\CompanyTable::getById($companyId)->fetch();
+    $factory = Container::getInstance()->getFactory(RIAI_REQUEST_TYPE);
+    $item = $factory->createItem([
+        'TITLE'          => 'Запрос: ' . ($company['TITLE'] ?? ('компания ' . $companyId)),
+        'COMPANY_ID'     => $companyId,
+        'PARENT_ID_' . RIAI_PURCHASE_TYPE => $purchaseId,
+        'ASSIGNED_BY_ID' => (int)$USER->GetID(),
+    ]);
+    $res = $factory->getAddOperation($item)->launch();   // проверяет права и запускает роботов/БП как обычно
+    if (!$res->isSuccess()) {
+        die(json_encode(['ok' => false, 'error' => implode('; ', $res->getErrorMessages())]));
+    }
+    $reqId = $item->getId();
+    if (RIAI_CREATE_OFFER_ROWS) {
+        $el = new CIBlockElement();
+        foreach ($positions as $p) {
+            $el->Add(['IBLOCK_ID' => 20, 'NAME' => $p['name'], 'PROPERTY_VALUES' => [
+                73 => 'T' . dechex(RIAI_REQUEST_TYPE) . '_' . $reqId,   // Запрос
+                74 => $p['id'],                                          // Позиция
+            ]]);
+        }
+    }
+    die(json_encode(['ok' => true, 'id' => $reqId,
+                     'url' => '/crm/type/' . RIAI_REQUEST_TYPE . '/details/' . $reqId . '/']));
+}
+
 if (!empty($_GET['debug'])) {   // диагностика: что нашлось на каждом шаге
     echo '<pre style="font-size:12px">';
     $factory = Container::getInstance()->getFactory(164);
@@ -108,160 +164,182 @@ $r = RiaiAdvice::get($purchaseId, $positions, 8, !empty($_GET['refresh']));
 if (empty($r['ok'])) {
     die('<div style="color:#a0662b">' . htmlspecialcharsbx($r['error'] ?? 'Ошибка') . '</div>');
 }
+$existing = riaiExistingRequests($purchaseId);
 
-// ---------- ссылки на сущности портала ----------
+// ---------- помощники отрисовки ----------
 $h = fn($s) => htmlspecialcharsbx((string)$s);
 $lnkCompany  = fn($id) => "/crm/company/details/{$id}/";
 $lnkRequest  = fn($id) => '/crm/type/' . RIAI_REQUEST_TYPE . "/details/{$id}/";
 $lnkPurchase = fn($id) => '/crm/type/' . RIAI_PURCHASE_TYPE . "/details/{$id}/";
-$price = fn($p) => $p ? number_format($p, 0, ',', ' ') . ' ₽' : '—';
-$offer = function ($o, $bold = false) use ($h, $lnkCompany, $lnkRequest, $lnkPurchase, $price) {
-    if (!$o) return '—';
-    $c = $o['company_id']
-        ? '<a href="' . $lnkCompany($o['company_id']) . '" target="_blank"' . ($bold ? ' style="font-weight:600;color:#2b8a3e"' : '') . '>' . $h($o['company']) . '</a>'
-        : $h($o['company'] ?: '—');
-    $refs = [];
-    if ($o['purchase_id']) $refs[] = '<a href="' . $lnkPurchase($o['purchase_id']) . '" target="_blank">закупка ' . (int)$o['purchase_id'] . '</a>';
-    if ($o['request_id'])  $refs[] = '<a href="' . $lnkRequest($o['request_id']) . '" target="_blank">запрос ' . (int)$o['request_id'] . '</a>';
-    // цена за единицу той позиции + пересчёт за базовую (кг/л/м), если единицы отличаются
-    $pr = $price($o['price']) . ($o['price'] && $o['unit'] ? '/' . $h($o['unit']) : '');
+$money = fn($p, $d = 0) => number_format((float)$p, $d, ',', ' ');
+$priceHtml = function ($o) use ($h, $money) {        // «950 ₽/меш. ≈ 38 ₽/кг»
+    if (!$o || !$o['price']) return '<span class="riai-muted">без цены</span>';
+    $d = $o['price'] < 100 ? 2 : 0;
+    $s = $money($o['price'], $d) . ' ₽' . ($o['unit'] ? '/' . $h(rtrim($o['unit'], '.')) : '');
     if ($o['unit_price'] && $o['base_unit'] && $o['base_unit'] !== rtrim((string)$o['unit'], '.')) {
-        $pr .= ' <span style="color:#80868e">≈ ' . number_format($o['unit_price'], 2, ',', ' ') . ' ₽/' . $h($o['base_unit']) . '</span>';
+        $s .= ' <span class="riai-muted">≈ ' . $money($o['unit_price'], 2) . ' ₽/' . $h($o['base_unit']) . '</span>';
     }
-    if (empty($o['comparable'])) {   // другая единица — цену напрямую не сравнивать
-        $pr = '<span style="color:#80868e" title="Другая единица измерения — цены напрямую не сравнивать">' . $pr . '</span>';
-    }
-    return $c . ' ' . $pr . ($o['selected'] ? ' ✓' : '')
-        . ' <span style="color:#80868e">· ' . $h($o['date']) . ($refs ? ' · ' . implode(' · ', $refs) : '') . '</span>';
+    return $s;
 };
+$reqLink = fn($o) => $o['request_id']
+    ? '<a href="' . $lnkRequest($o['request_id']) . '" target="_blank">' . $h($o['request_title'] ?: 'Запрос ' . $o['request_id']) . '</a>'
+    : '—';
 $num = [];
+foreach ($r['positions'] as $i => $p) $num[$p['id']] = $i + 1;
+
+$cols = array_slice($r['suppliers'], 0, RIAI_COLUMNS);
+// лучшая цена в строке (за базовую единицу, только сопоставимые)
+$rowBest = [];
+foreach ($r['positions'] as $p) {
+    foreach ($cols as $s) {
+        $c = $s['cells'][$p['id']] ?? null;
+        if ($c && $c['comparable'] && $c['unit_price'] !== null
+            && (!isset($rowBest[$p['id']]) || $c['unit_price'] < $rowBest[$p['id']])) {
+            $rowBest[$p['id']] = $c['unit_price'];
+        }
+    }
+}
+$box = 'riai-box-' . $purchaseId;
 ?>
 <style>
 .riai{font-size:13px;line-height:1.45;color:#1f2d3d}
-.riai table{border-collapse:collapse;width:100%;background:#fff}
-.riai th,.riai td{border-bottom:1px solid #e5e9ee;padding:6px 8px;text-align:left;vertical-align:top}
+.riai table{border-collapse:collapse;background:#fff;width:100%}
+.riai th,.riai td{border:1px solid #e1e5ea;padding:6px 8px;vertical-align:top;text-align:left}
 .riai th{background:#f5f7f9;font-weight:600;color:#525c69}
-.riai h3{font-size:15px;margin:18px 0 8px}
-.riai details summary{cursor:pointer;color:#2067b0}
+.riai .riai-matrix td.c,.riai .riai-matrix th.c{text-align:center;min-width:150px}
+.riai .riai-matrix tr.sep td{background:#fafbfc}
+.riai .riai-muted{color:#80868e}
+.riai .riai-best{color:#2b8a3e;font-weight:700}
+.riai .riai-sel{color:#2b8a3e}
+.riai .riai-small{font-size:12px}
+.riai h3{font-size:15px;margin:22px 0 8px}
 .riai .note{background:#f5f7f9;padding:8px 10px;border-radius:4px;margin-bottom:10px;color:#525c69}
 </style>
-<div class="riai" id="riai-box-<?= $purchaseId ?>">
+<div class="riai" id="<?= $box ?>">
 <div style="margin-bottom:8px">
   <button type="button" class="ui-btn ui-btn-light-border ui-btn-xs" onclick="(function(b){
-      var box=document.getElementById('riai-box-<?= $purchaseId ?>'); b.disabled=true; b.textContent='Обновляю…';
+      var box=document.getElementById('<?= $box ?>'); b.disabled=true; b.textContent='Обновляю…';
       BX.ajax({url:'/local/ajax/riai_advice.php?purchase=<?= $purchaseId ?>&refresh=1', method:'GET', dataType:'html', timeout:120,
-        onsuccess:function(h){ BX.html(box.parentNode, h); }, onfailure:function(){ b.disabled=false; b.textContent='Ошибка, ещё раз'; }});
+        onsuccess:function(html){ BX.html(box.parentNode, html); }, onfailure:function(){ b.disabled=false; b.textContent='Ошибка, ещё раз'; }});
   })(this)">Обновить подсказки</button>
+  <span class="riai-muted riai-small">История закупок на <?= $h($r['updated']) ?>.
+  Цены — из прошлых предложений; <span class="riai-best">зелёным</span> — лучшая в строке, ✓ — предложение выбирали.</span>
 </div>
-<div class="note">Подсказки по истории закупок, данные на <?= $h($r['updated']) ?>. ✓ — предложение было выбрано.
-«≈ … ₽/кг» — цена, пересчитанная по фасовке; серым — другая единица, напрямую не сравнивать.
-«Лучшая цена» считается только среди сопоставимых единиц.</div>
-<h3>Позиции</h3>
-<table>
-<tr><th>№</th><th>Позиция</th><th>Кол-во</th><th>Последний раз выбрали</th><th>Лучшая цена в истории</th></tr>
-<?php foreach ($r['positions'] as $i => $p): $num[$p['id']] = $i + 1; ?>
+
+<?php if (!$cols): ?>
+<div class="note">По истории предложить некого — позиции закупки раньше не встречались.</div>
+<?php else: ?>
+<table class="riai-matrix">
 <tr>
-  <td><?= $i + 1 ?></td>
-  <td><?= $h($p['name']) ?>
-    <?php if ($p['matches']): ?>
-    <details><summary>похожие позиции в истории: <?= count($p['matches']) ?></summary>
-      <table>
-      <tr><th>Похож.</th><th>Позиция</th><th>Предложения</th></tr>
-      <?php foreach ($p['matches'] as $m): ?>
-      <tr><td><?= $h($m['score']) ?></td>
-          <td><?= $h($m['name']) ?> <span style="color:#80868e">(<?= $h($m['qty']) ?> <?= $h($m['unit']) ?>)</span></td>
-          <td><?= implode('<br>', array_map(fn($o) => $offer($o), $m['offers'])) ?></td></tr>
-      <?php endforeach; ?>
-      </table>
-    </details>
+  <th>Позиция</th><th>Кол-во</th><th>Ед.</th>
+  <?php foreach ($cols as $s): ?>
+  <th class="c"><a href="<?= $lnkCompany($s['company_id']) ?>" target="_blank"><?= $h($s['company']) ?></a></th>
+  <?php endforeach; ?>
+</tr>
+<?php foreach ($r['positions'] as $p): ?>
+<tr>
+  <td><?= $num[$p['id']] ?>. <?= $h($p['name']) ?></td>
+  <td><?= $h($p['qty']) ?></td>
+  <td><?= $h($p['unit']) ?></td>
+  <?php foreach ($cols as $s): $c = $s['cells'][$p['id']] ?? null;
+      $isBest = $c && $c['comparable'] && $c['unit_price'] !== null && isset($rowBest[$p['id']]) && $c['unit_price'] == $rowBest[$p['id']]; ?>
+  <td class="c">
+    <?php if (!$c): ?><span class="riai-muted">—</span>
+    <?php else: ?>
+      <span class="<?= $isBest ? 'riai-best' : ($c['comparable'] ? '' : 'riai-muted') ?>"
+            title="<?= $c['comparable'] ? '' : 'Другая единица — напрямую не сравнивать' ?>"><?= $priceHtml($c) ?></span><?= $c['selected'] ? ' <span class="riai-sel">✓</span>' : '' ?>
+      <div class="riai-muted riai-small"><?= $h($c['date']) ?></div>
     <?php endif; ?>
   </td>
-  <td><?= $h($p['qty']) ?> <?= $h($p['unit']) ?></td>
-  <td><?= $p['last_selected'] ? $offer($p['last_selected'], true)
-        : ($p['status'] === 'new' ? '<span style="color:#a0662b">не закупали</span>' : '<span style="color:#80868e">запрашивали, без выбора</span>') ?></td>
-  <td><?= $offer($p['best_price']) ?></td>
+  <?php endforeach; ?>
 </tr>
 <?php endforeach; ?>
+<tr class="sep">
+  <td colspan="3"><b>Итого по закупке</b><div class="riai-muted riai-small">кол-во × цена, где цену можно сравнить</div></td>
+  <?php foreach ($cols as $s): ?>
+  <td class="c"><?= $s['total'] !== null ? '<b>' . $money($s['total']) . ' ₽</b>' : '<span class="riai-muted">—</span>' ?>
+    <div class="riai-muted riai-small">позиций с ценой: <?= (int)$s['total_covered'] ?> из <?= count($r['positions']) ?></div></td>
+  <?php endforeach; ?>
+</tr>
+<tr>
+  <td colspan="3">Где была эта цена</td>
+  <?php foreach ($cols as $s): ?>
+  <td class="c riai-small"><?php
+      $lines = [];
+      foreach ($r['positions'] as $p) {
+          $c = $s['cells'][$p['id']] ?? null;
+          if (!$c) continue;
+          $lines[] = '№' . $num[$p['id']] . ': ' . $reqLink($c) . '<br><span class="riai-muted">' . $h($c['date']) . ' · '
+              . ($c['selected'] ? '<span class="riai-sel">выбран</span>' : 'не выбран')
+              . ($c['purchase_id'] ? ' · <a href="' . $lnkPurchase($c['purchase_id']) . '" target="_blank">закупка ' . (int)$c['purchase_id'] . '</a>' : '')
+              . '</span>';
+      }
+      echo implode('<div style="height:6px"></div>', $lines);
+  ?></td>
+  <?php endforeach; ?>
+</tr>
+<tr>
+  <td colspan="3">Надёжность</td>
+  <?php foreach ($cols as $s): ?>
+  <td class="c riai-small">
+    Брали: <b><?= (int)$s['wins'] ?></b> из <?= (int)$s['offers'] ?> предложений<br>
+    Лучшая цена: <b><?= (int)$s['best_count'] ?></b> из <?= (int)$s['priced_count'] ?> конкурсов
+  </td>
+  <?php endforeach; ?>
+</tr>
+<tr>
+  <td colspan="3"></td>
+  <?php foreach ($cols as $s): $ex = $existing[(int)$s['company_id']] ?? null; ?>
+  <td class="c">
+    <?php if ($ex): ?>
+      <button type="button" class="ui-btn ui-btn-xs ui-btn-light" disabled>Запрос создан</button>
+      <div class="riai-small"><a href="<?= $lnkRequest($ex['id']) ?>" target="_blank"><?= $h($ex['title'] ?: 'Запрос ' . $ex['id']) ?></a></div>
+    <?php else: ?>
+      <button type="button" class="ui-btn ui-btn-xs ui-btn-primary" onclick="(function(b){
+          b.disabled=true; b.textContent='Создаю…';
+          BX.ajax({url:'/local/ajax/riai_advice.php?purchase=<?= $purchaseId ?>', method:'POST', dataType:'json', timeout:60,
+            data:{action:'create_request', company:<?= (int)$s['company_id'] ?>, sessid:BX.bitrix_sessid()},
+            onsuccess:function(res){
+              if(res && res.ok){ b.textContent='Запрос создан'; b.className='ui-btn ui-btn-xs ui-btn-light';
+                var a=document.createElement('div'); a.className='riai-small';
+                a.innerHTML='<a href=&quot;'+res.url+'&quot; target=&quot;_blank&quot;>открыть запрос</a>'; b.parentNode.appendChild(a); }
+              else { b.disabled=false; b.textContent='Создать запрос'; alert((res && res.error) || 'Не удалось создать запрос'); }
+            },
+            onfailure:function(){ b.disabled=false; b.textContent='Создать запрос'; alert('Не удалось создать запрос'); }});
+      })(this)">Создать запрос</button>
+    <?php endif; ?>
+  </td>
+  <?php endforeach; ?>
+</tr>
 </table>
+<?php if (count($r['suppliers']) > RIAI_COLUMNS): ?>
+<div class="riai-muted riai-small" style="margin-top:4px">Ещё поставщиков в истории: <?= count($r['suppliers']) - RIAI_COLUMNS ?> — см. таблицы ниже.</div>
+<?php endif; ?>
+<?php endif; ?>
 
-<h3>Кому отправить запросы</h3>
-<?php if (!$r['suppliers']): ?>
-<div class="note">По истории предложить некого — позиции новые.</div>
+<?php foreach ($r['positions'] as $p):
+    $rows = [];
+    foreach ($p['matches'] as $m) foreach ($m['offers'] as $o) $rows[] = $o + ['hist' => $m['name'], 'hist_qty' => $m['qty'], 'hist_unit' => $m['unit']];
+    usort($rows, fn($a, $b) => strcmp(implode('', array_reverse(explode('.', $b['date']))), implode('', array_reverse(explode('.', $a['date'])))));
+?>
+<h3><?= $num[$p['id']] ?>. <?= $h($p['name']) ?> <span class="riai-muted">— <?= $h($p['qty']) ?> <?= $h($p['unit']) ?></span></h3>
+<?php if (!$rows): ?>
+<div class="note">Раньше не закупали.</div>
 <?php else: ?>
-<div class="note">Порядок: <?= $h($r['sort']['suppliers'] ?? '') ?>. Нажмите на заголовок столбца, чтобы пересортировать.
-«Цена» — насколько поставщик дороже лучшей цены по тем же позициям (1,00 — самый дешёвый, 1,25 — на 25% дороже).</div>
-<table class="riai-sort">
-<tr>
-  <th onclick="riaiSort(this,'text',true)">Поставщик</th>
-  <th onclick="riaiSort(this,'num')">Позиции</th>
-  <th onclick="riaiSort(this,'num')">Выбирали</th>
-  <th onclick="riaiSort(this,'num')">Предложений</th>
-  <th onclick="riaiSort(this,'num',true)">Цена</th>
-  <th onclick="riaiSort(this,'num')">Последнее предложение</th>
-  <th onclick="riaiSort(this,'num')">Закупки</th>
-</tr>
-<?php foreach ($r['suppliers'] as $s):
-    $d = $s['last_date'] ? (int)implode('', array_reverse(explode('.', $s['last_date']))) : 0; ?>
-<tr>
-  <td data-v="<?= $h($s['company']) ?>"><a href="<?= $lnkCompany($s['company_id']) ?>" target="_blank"><?= $h($s['company']) ?></a></td>
-  <td data-v="<?= count($s['position_ids']) ?>"><?= implode(', ', array_map(fn($id) => '№' . ($num[$id] ?? $id), $s['position_ids'])) ?></td>
-  <td data-v="<?= (int)$s['wins'] ?>"><?= (int)$s['wins'] ?></td>
-  <td data-v="<?= (int)$s['offers'] ?>"><?= (int)$s['offers'] ?></td>
-  <td data-v="<?= $s['price_index'] ?? 999 ?>"><?= $s['price_index'] !== null
-        ? ($s['price_index'] <= 1.0 ? '<b style="color:#2b8a3e">лучшая</b>' : number_format($s['price_index'], 2, ',', ' '))
-        : '<span style="color:#80868e">нет цены</span>' ?></td>
-  <td data-v="<?= $d ?>"><?= $s['last'] ? ($s['last']['price'] ? $offer($s['last'])
-        : '<span style="color:#80868e">без цены · ' . $h($s['last']['date']) . '</span>'
-          . ($s['last']['request_id'] ? ' · <a href="' . $lnkRequest($s['last']['request_id']) . '" target="_blank">запрос ' . (int)$s['last']['request_id'] . '</a>' : ''))
-        : '—' ?></td>
-  <td data-v="<?= count($s['purchase_ids']) ?>"><?= implode(', ', array_map(
-        fn($id) => '<a href="' . $lnkPurchase($id) . '" target="_blank">' . (int)$id . '</a>', array_slice($s['purchase_ids'], 0, 5)))
-        . (count($s['purchase_ids']) > 5 ? ' …' : '') ?></td>
-</tr>
-<?php endforeach; ?>
-</table>
-<?php endif; ?>
-
-<?php if (!empty($r['purchases'])): ?>
-<h3>Похожие прошлые закупки</h3>
-<div class="note">Закупки, где уже были эти позиции. Порядок: <?= $h($r['sort']['purchases'] ?? '') ?>.
-Если в одной прошлой закупке совпало несколько позиций — это сильный аналог, её поставщики — первые кандидаты.</div>
 <table>
-<tr><th>Закупка</th><th>Дата</th><th>Совпали позиции</th><th>Поставщики (✓ — выбран)</th></tr>
-<?php foreach ($r['purchases'] as $g): ?>
+<tr><th>Дата</th><th>Поставщик</th><th>Цена</th><th>Выбран</th><th>Запрос</th><th>Закупка</th><th>Как называлась позиция</th></tr>
+<?php foreach (array_slice($rows, 0, 40) as $o): ?>
 <tr>
-  <td><a href="<?= $lnkPurchase($g['purchase_id']) ?>" target="_blank">закупка <?= (int)$g['purchase_id'] ?></a></td>
-  <td><?= $h($g['date']) ?></td>
-  <td><?= implode('<br>', array_map(fn($id) => '№' . ($num[$id] ?? $id) . ' <span style="color:#80868e">как «'
-        . $h(implode('», «', $g['matched'][$id] ?? [])) . '»</span>', $g['position_ids'])) ?></td>
-  <td><?= implode('<br>', array_map(function ($x) use ($h, $lnkCompany, $price, $num) {
-        $name = $x['company_id'] ? '<a href="' . $lnkCompany($x['company_id']) . '" target="_blank">' . $h($x['company']) . '</a>' : $h($x['company'] ?: '—');
-        $ps = array_map(fn($o) => '№' . ($num[$o['for_position_id']] ?? '') . ' ' . $price($o['price'])
-            . ($o['price'] && $o['unit'] ? '/' . $h($o['unit']) : '') . ($o['selected'] ? ' ✓' : ''), $x['offers']);
-        return $name . ': ' . implode('; ', $ps);
-    }, $g['suppliers'])) ?></td>
+  <td><?= $h($o['date']) ?></td>
+  <td><?= $o['company_id'] ? '<a href="' . $lnkCompany($o['company_id']) . '" target="_blank">' . $h($o['company']) . '</a>' : $h($o['company'] ?: '—') ?></td>
+  <td class="<?= $o['comparable'] ? '' : 'riai-muted' ?>"><?= $priceHtml($o) ?></td>
+  <td><?= $o['selected'] ? '<span class="riai-sel">✓ выбран</span>' : '<span class="riai-muted">нет</span>' ?></td>
+  <td><?= $reqLink($o) ?></td>
+  <td><?= $o['purchase_id'] ? '<a href="' . $lnkPurchase($o['purchase_id']) . '" target="_blank">' . (int)$o['purchase_id'] . '</a>' : '—' ?></td>
+  <td class="riai-muted"><?= $h($o['hist']) ?> (<?= $h($o['hist_qty']) ?> <?= $h($o['hist_unit']) ?>)</td>
 </tr>
 <?php endforeach; ?>
 </table>
 <?php endif; ?>
-<script>
-window.riaiSort = window.riaiSort || function (th, type, firstAsc) {
-    // первый клик: текст и цена — по возрастанию, остальное — по убыванию; повторный клик — наоборот
-    var table = th.closest('table'), rows = Array.prototype.slice.call(table.rows, 1), i = th.cellIndex;
-    var dir = th.dataset.dir ? (th.dataset.dir === 'asc' ? 'desc' : 'asc') : (firstAsc ? 'asc' : 'desc');
-    Array.prototype.forEach.call(th.parentNode.cells, function (c) {
-        delete c.dataset.dir; c.textContent = c.textContent.replace(/ [↑↓]$/, '');
-    });
-    th.dataset.dir = dir;
-    th.textContent += dir === 'asc' ? ' ↑' : ' ↓';
-    rows.sort(function (a, b) {
-        var x = a.cells[i].dataset.v, y = b.cells[i].dataset.v;
-        var r = type === 'num' ? parseFloat(x) - parseFloat(y) : String(x).localeCompare(String(y), 'ru');
-        return dir === 'asc' ? r : -r;
-    });
-    rows.forEach(function (row) { row.parentNode.appendChild(row); });
-};
-</script>
-<style>.riai table.riai-sort th{cursor:pointer;user-select:none}.riai table.riai-sort th:hover{color:#2067b0}</style>
+<?php endforeach; ?>
 </div>
-<?php
