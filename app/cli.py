@@ -16,6 +16,8 @@
 """
 import sys
 
+LOCKS = []   # блокировки от двойного запуска живут до конца процесса
+
 
 def main():
     args = sys.argv[1:]
@@ -27,6 +29,8 @@ def main():
         from .discover import run
         run()
     elif cmd == "sync":
+        from .lock import single
+        LOCKS.append(single("sync"))
         from .sync import run
         run(full="--full" in rest, restart="--restart" in rest)
     elif cmd == "report":
@@ -39,18 +43,26 @@ def main():
         from .llm import list_models
         list_models()
     elif cmd == "taxonomy-propose":
+        from .lock import single
+        LOCKS.append(single("taxonomy"))
         from .taxonomy import propose
         propose()
     elif cmd == "taxonomy-consolidate":
+        from .lock import single
+        LOCKS.append(single("taxonomy"))
         from .taxonomy import consolidate
         consolidate()
     elif cmd == "taxonomy-other":
         from .taxonomy import show_other
         show_other(int(rest[0]) if rest else 80)
     elif cmd == "taxonomy-fix":
+        from .lock import single
+        LOCKS.append(single("taxonomy"))
         from .taxonomy import fix
         fix()
     elif cmd == "taxonomy-classify":
+        from .lock import single
+        LOCKS.append(single("taxonomy"))
         from .taxonomy import classify
         lim = int(rest[rest.index("--limit") + 1]) if "--limit" in rest else None
         classify(reset="--reset" in rest, limit=lim, retry_other="--retry-other" in rest, yes="--yes" in rest)
