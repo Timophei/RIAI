@@ -8,7 +8,6 @@
 КПТ-8, DEEPCOOL Z3 и Thermalright TF3 — один тип «Термопаста».
 """
 import os
-import random
 import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -71,46 +70,95 @@ def history_names(con):
     return {n: (raw[n], c) for n, c in cnt.items()}
 
 
-# ---------- 1. предложить дерево ----------
-PROPOSE_SYS = """Ты — эксперт по закупкам промышленно-строительного предприятия (металлопрокат, стройматериалы,
-бетон, электротехника, инструмент и оснастка, метизы, спецодежда и СИЗ, химия, хозтовары, канцелярия, оргтехника и ПК,
-запчасти к технике и т. п.). По списку реальных названий позиций из заявок построй дерево номенклатуры из трёх уровней:
-Раздел → Группа → Тип.
-Тип — это товары, которые заменяют друг друга или покупаются у одних и тех же поставщиков, независимо от марки,
-размера и фасовки (например, «Термопаста» — и КПТ-8, и DEEPCOOL Z3; «Электроды сварочные» — любые марки и диаметры;
-«Швеллер» — любые номера). Но разное назначение — разные типы, даже при одинаковом слове:
-«Патрон для ламп» (Электротехника) и «Патрон для перфоратора» (Инструмент).
-10–20 разделов, в каждом 2–10 групп, всего 150–400 типов. Названия короткие, по-русски, во множественном числе
-или как принято в каталогах. Для каждого типа дай 1–3 примера из списка.
-Ответ — JSON: {"sections":[{"name":"...","groups":[{"name":"...","types":[{"name":"...","examples":["..."]}]}]}]}"""
+# ---------- 1. предложить дерево (снизу вверх: от реальных «главных слов» истории) ----------
+SECTIONS = [
+    "Металлопрокат", "Метизы и крепёж", "Сварка", "Стройматериалы", "Бетон, растворы, сухие смеси",
+    "Лакокрасочные материалы", "Электротехника и кабель", "Освещение", "Сантехника и трубопроводная арматура",
+    "Ручной инструмент", "Электроинструмент и оборудование", "Расходники для инструмента (диски, свёрла, абразив)",
+    "Спецодежда и СИЗ", "Химия, ГСМ, смазки", "Запчасти к технике и автотовары", "Подшипники, РТИ, приводы",
+    "Оргтехника, ПК и комплектующие", "Связь и электроника", "Канцелярия", "Хозтовары и бытовая химия",
+    "Мебель и бытовая техника", "Продукты и вода", "Услуги и работы", "Прочее",
+]
+
+PROPOSE_SYS = """Ты — эксперт по закупкам промышленно-строительного предприятия. Тебе дают «главные слова» из названий
+позиций заявок на закупку, у каждого — примеры реальных названий. Для каждого слова определи место в дереве номенклатуры:
+«Раздел › Группа › Тип».
+Раздел — строго один из списка: {sections}.
+Группа — более узкое направление внутри раздела (например «Крепёж резьбовой», «Лампы», «Комплектующие ПК»).
+Тип — товары, которые заменяют друг друга или покупаются у одних и тех же поставщиков, независимо от марки, размера,
+фасовки (например «Термопаста» — и КПТ-8, и DEEPCOOL Z3; «Болты»; «Электроды сварочные»; «Лампы накаливания»).
+Группа и тип не должны совпадать: группа шире. Названия — по-русски, как в каталогах, во множественном числе.
+Если по примерам слово означает разные товары (например «патрон» — для ламп и для перфоратора), выбери самое частое
+значение по примерам.
+Ответ — JSON: {{"items":[{{"i":<номер слова>,"path":"Раздел › Группа › Тип"}}]}} — для каждого слова."""
 
 
-def propose(sample=1200):
+def propose(top=1500, chunk=120, workers=4):
     con = db.connect()
     names = history_names(con)
     if not names:
         raise SystemExit("История пуста — сначала sync")
     by_head = defaultdict(list)
     for n, (raw, c) in names.items():
-        by_head[head(raw) or "?"].append((c, raw))
-    # самые частые «главные слова» с парой примеров + случайная добавка, чтобы не потерять редкое
-    heads = sorted(by_head, key=lambda h: -sum(c for c, _ in by_head[h]))
-    picked = []
-    for h in heads[: sample // 2]:
-        picked += [r for _, r in sorted(by_head[h], reverse=True)[:2]]
-    chosen = set(picked)
-    rest = [raw for raw, _ in names.values() if raw not in chosen]
-    random.seed(1)
-    picked += random.sample(rest, min(len(rest), max(0, sample - len(picked))))
-    lst = "\n".join(f"- {p[:90]}" for p in picked)
-    print(f"Названий в истории: {len(names)}, в выборке для модели: {len(picked)}. Жду ответ модели…")
-    res = chat_json(PROPOSE_SYS, "Названия позиций:\n" + lst)
-    tree = res.get("sections") or []
-    if not tree:
-        raise SystemExit(f"Модель не вернула дерево: {str(res)[:300]}")
-    save_tree(tree)
-    n_types = sum(len(g.get("types", [])) for s in tree for g in s.get("groups", []))
-    print(f"Готово: {len(tree)} разделов, {n_types} типов → {TREE}\nПросмотр: cat {TREE}")
+        h = head(raw)
+        if h:
+            by_head[h].append((c, raw))
+    weight = {h: sum(c for c, _ in v) for h, v in by_head.items()}
+    heads = sorted(by_head, key=lambda h: -weight[h])[:top]
+    total = sum(weight.values())
+    covered = sum(weight[h] for h in heads)
+    print(f"Названий: {len(names)}, «главных слов»: {len(by_head)}; беру {len(heads)} самых частых — "
+          f"они покрывают {covered * 100 // max(total, 1)}% позиций. Пачек к модели: {len(heads) // chunk + 1}")
+    sys_prompt = PROPOSE_SYS.format(sections="; ".join(SECTIONS))
+    chunks = [heads[i:i + chunk] for i in range(0, len(heads), chunk)]
+
+    def ask(hs):
+        lines = []
+        for i, h in enumerate(hs, 1):
+            ex = "; ".join(r[:70] for _, r in sorted(by_head[h], reverse=True)[:3])
+            lines.append(f"{i}. {h} — {ex}")
+        res = chat_json(sys_prompt, "Слова:\n" + "\n".join(lines))
+        out = {}
+        for it in res.get("items") or []:
+            try:
+                i, path = int(it["i"]), str(it["path"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            parts = [x.strip() for x in path.split("›")]
+            if 1 <= i <= len(hs) and len(parts) == 3 and all(parts):
+                if parts[0] not in SECTIONS:
+                    parts[0] = "Прочее"
+                out[hs[i - 1]] = parts
+        return out
+
+    paths, done = {}, 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for got in ex.map(ask, chunks):
+            paths.update(got)
+            done += 1
+            print(f"\r  пачек: {done}/{len(chunks)}", end="", flush=True)
+    print()
+    # собрать дерево; одинаковые типы/группы без учёта регистра — склеить
+    tree, canon = {}, {}
+    for h in heads:
+        if h not in paths:
+            continue
+        sec, grp, typ = paths[h]
+        key_g = (sec, grp.lower())
+        grp = canon.setdefault(key_g, grp)
+        key_t = (sec, grp, typ.lower())
+        typ = canon.setdefault(key_t, typ)
+        t = tree.setdefault(sec, {}).setdefault(grp, {}).setdefault(typ, [])
+        if len(t) < 3:
+            t.append(sorted(by_head[h], reverse=True)[0][1][:60])
+    sections = [{"name": s, "groups": [{"name": g, "types": [{"name": t, "examples": ex}
+                                                             for t, ex in sorted(tree[s][g].items())]}
+                                       for g in sorted(tree[s])]}
+                for s in SECTIONS if s in tree]
+    save_tree(sections)
+    n_groups = sum(len(v) for v in tree.values())
+    n_types = sum(len(t) for v in tree.values() for t in v.values())
+    print(f"Готово: {len(sections)} разделов, {n_groups} групп, {n_types} типов → {TREE}")
 
 
 # ---------- 2. разложить названия по дереву ----------
