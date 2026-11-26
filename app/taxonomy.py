@@ -1,6 +1,7 @@
 """Дерево типов номенклатуры: «Раздел › Группа › Тип».
 
-  taxonomy-propose       модель смотрит выборку названий из истории и предлагает дерево → data/taxonomy.txt
+  taxonomy-propose       модель строит дерево от частых «главных слов» истории и сразу убирает его → data/taxonomy.txt
+  taxonomy-consolidate   ещё раз навести порядок в дереве (после ручной правки или если осталось дробно)
                          (файл можно и нужно поправить руками: переименовать, слить, добавить типы)
   taxonomy-classify      раскладывает все названия истории по типам дерева → таблица name_types
                          (продолжает с места остановки; --reset — заново, после правки дерева)
@@ -41,6 +42,39 @@ def load_tree(path=TREE):
     if not leaves:
         raise SystemExit(f"В {path} не нашлось ни одного типа")
     return leaves
+
+
+def load_tree_examples(path=TREE):
+    """[(путь, [примеры])] — для уборки дерева."""
+    sec = grp = None
+    out = []
+    for line in open(path, encoding="utf-8"):
+        line = line.rstrip()
+        if line.startswith("## "):
+            grp = line[3:].strip()
+        elif line.startswith("# "):
+            sec, grp = line[2:].strip(), None
+        elif line.lstrip().startswith("- ") and sec and grp:
+            body = line.lstrip()[2:]
+            t, _, ex = body.partition("  //")
+            if t.strip():
+                out.append((f"{sec} › {grp} › {t.strip()}", [e.strip() for e in ex.split(";") if e.strip()]))
+    return out
+
+
+def build_tree(pairs):
+    """[(путь, примеры)] → структура для save_tree; одинаковые пути склеиваются, порядок разделов — как в SECTIONS."""
+    tree = {}
+    for path, ex in pairs:
+        sec, grp, typ = [x.strip() for x in path.split("›")]
+        t = tree.setdefault(sec, {}).setdefault(grp, {}).setdefault(typ, [])
+        for e in ex:
+            if e not in t and len(t) < 3:
+                t.append(e)
+    order = [s for s in SECTIONS if s in tree] + sorted(s for s in tree if s not in SECTIONS)
+    return [{"name": s, "groups": [{"name": g, "types": [{"name": t, "examples": ex}
+                                                       for t, ex in sorted(tree[s][g].items())]}
+                                   for g in sorted(tree[s])]} for s in order]
 
 
 def save_tree(tree, path=TREE):
@@ -138,27 +172,81 @@ def propose(top=1500, chunk=120, workers=4):
             done += 1
             print(f"\r  пачек: {done}/{len(chunks)}", end="", flush=True)
     print()
-    # собрать дерево; одинаковые типы/группы без учёта регистра — склеить
-    tree, canon = {}, {}
+    # одинаковые типы/группы без учёта регистра — склеить
+    canon, pairs = {}, []
     for h in heads:
         if h not in paths:
             continue
         sec, grp, typ = paths[h]
-        key_g = (sec, grp.lower())
-        grp = canon.setdefault(key_g, grp)
-        key_t = (sec, grp, typ.lower())
-        typ = canon.setdefault(key_t, typ)
-        t = tree.setdefault(sec, {}).setdefault(grp, {}).setdefault(typ, [])
-        if len(t) < 3:
-            t.append(sorted(by_head[h], reverse=True)[0][1][:60])
-    sections = [{"name": s, "groups": [{"name": g, "types": [{"name": t, "examples": ex}
-                                                             for t, ex in sorted(tree[s][g].items())]}
-                                       for g in sorted(tree[s])]}
-                for s in SECTIONS if s in tree]
-    save_tree(sections)
-    n_groups = sum(len(v) for v in tree.values())
-    n_types = sum(len(t) for v in tree.values() for t in v.values())
-    print(f"Готово: {len(sections)} разделов, {n_groups} групп, {n_types} типов → {TREE}")
+        grp = canon.setdefault((sec, grp.lower()), grp)
+        typ = canon.setdefault((sec, grp, typ.lower()), typ)
+        pairs.append((f"{sec} › {grp} › {typ}", [sorted(by_head[h], reverse=True)[0][1][:60]]))
+    tree = build_tree(pairs)
+    save_tree(tree)
+    n_groups = sum(len(s["groups"]) for s in tree)
+    n_types = sum(len(g["types"]) for s in tree for g in s["groups"])
+    print(f"Черновик: {len(tree)} разделов, {n_groups} групп, {n_types} типов")
+    consolidate(workers=workers)
+
+
+# ---------- 1б. уборка дерева: синонимы, дубли, мусор, укрупнение групп ----------
+CONSOLIDATE_SYS = """Ты наводишь порядок в разделе «{section}» дерева номенклатуры закупок промышленно-строительного предприятия.
+Тебе дают типы раздела в виде «N. Группа › Тип // примеры названий». Для каждого выдай новый путь «Раздел › Группа › Тип»:
+- объедини в один тип синонимы, опечатки, единственное/множественное число и слишком узкие варианты
+  («Круг» и «Круги»; «Сопла» и «Сапла»; «Профтрубы», «Профильные трубы», «Профилированные трубы»);
+- в разделе должно быть 5–25 групп; группа заметно шире типа (не «Болты › Болты», а «Крепёж резьбовой › Болты»);
+- тип — товары, которые заменяют друг друга или берутся у одних поставщиков; не дроби по маркам и размерам;
+- если тип явно из другого раздела — перенеси в подходящий из списка: {sections};
+- мусор, тесты, обрывки слов, ссылки, «первая/вторая позиция» → «Прочее › Мусор › Мусор».
+Названия — по-русски, во множественном числе, как в каталогах.
+Ответ — JSON: {{"items":[{{"i":<номер>,"path":"Раздел › Группа › Тип"}}]}} — для каждого номера."""
+
+
+def consolidate(workers=4, chunk=220):
+    pairs = load_tree_examples()
+    by_sec = defaultdict(list)
+    for path, ex in pairs:
+        by_sec[path.split(" › ")[0]].append((path, ex))
+    jobs = []
+    for sec, items in by_sec.items():
+        for i in range(0, len(items), chunk):
+            jobs.append((sec, items[i:i + chunk]))
+    print(f"Уборка: типов {len(pairs)}, разделов {len(by_sec)}, запросов к модели: {len(jobs)}")
+
+    def ask(job):
+        sec, items = job
+        sys_prompt = CONSOLIDATE_SYS.format(section=sec, sections="; ".join(SECTIONS))
+        lines = [f"{i}. {p.split(' › ', 1)[1]}" + (f" // {'; '.join(ex[:2])}" if ex else "")
+                 for i, (p, ex) in enumerate(items, 1)]
+        res = chat_json(sys_prompt, "\n".join(lines))
+        out = []
+        mapped = {}
+        for it in res.get("items") or []:
+            try:
+                i, path = int(it["i"]), str(it["path"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            parts = [x.strip() for x in path.split("›")]
+            if 1 <= i <= len(items) and len(parts) == 3 and all(parts):
+                if parts[0] not in SECTIONS:
+                    parts[0] = sec
+                mapped[i] = " › ".join(parts)
+        for i, (p, ex) in enumerate(items, 1):
+            out.append((mapped.get(i, p), ex))   # не ответила по типу — оставляем как было
+        return out
+
+    result, done = [], 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for got in ex.map(ask, jobs):
+            result += got
+            done += 1
+            print(f"\r  запросов: {done}/{len(jobs)}", end="", flush=True)
+    print()
+    tree = build_tree(result)
+    save_tree(tree)
+    n_groups = sum(len(s["groups"]) for s in tree)
+    n_types = sum(len(g["types"]) for s in tree for g in s["groups"])
+    print(f"После уборки: {len(tree)} разделов, {n_groups} групп, {n_types} типов → {TREE}")
 
 
 # ---------- 2. разложить названия по дереву ----------

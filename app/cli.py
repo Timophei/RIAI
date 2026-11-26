@@ -5,7 +5,8 @@
   sync --restart    — начать полную загрузку заново
   report [запросы]  — отчёт по позициям, напр.: report "Бумага А4" "Швеллер 40"
   llm-check         — проверить доступ к модели (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROXY в .env)
-  taxonomy-propose  — модель предлагает дерево типов по выборке истории → data/taxonomy.txt
+  taxonomy-propose  — модель строит дерево типов по истории и убирает дубли → data/taxonomy.txt
+  taxonomy-consolidate — ещё раз навести порядок в дереве (склеить дубли, укрупнить группы)
   taxonomy-classify [--reset] [--limit N] — разложить все названия истории по дереву
 """
 import sys
@@ -32,6 +33,9 @@ def main():
     elif cmd == "taxonomy-propose":
         from .taxonomy import propose
         propose()
+    elif cmd == "taxonomy-consolidate":
+        from .taxonomy import consolidate
+        consolidate()
     elif cmd == "taxonomy-classify":
         from .taxonomy import classify
         lim = int(rest[rest.index("--limit") + 1]) if "--limit" in rest else None
