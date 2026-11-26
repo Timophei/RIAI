@@ -24,9 +24,11 @@ def configured():
 
 def chat_json(system, user, model=None, temperature=0, retries=4, timeout=180):
     """Запрос к модели, ответ — JSON-объект. Повторяет при сетевых ошибках и лимитах."""
-    key = os.environ.get("LLM_API_KEY")
+    key = (os.environ.get("LLM_API_KEY") or "").strip()
     if not key:
         raise LLMError("Не задан LLM_API_KEY в .env")
+    if not key.isascii() or " " in key:
+        raise LLMError("LLM_API_KEY в .env похож на заглушку (русские буквы или пробелы) — впишите настоящий ключ")
     base = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     model = model or os.environ.get("LLM_MODEL", "gpt-4o-mini")
     proxy = os.environ.get("LLM_PROXY")
