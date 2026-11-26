@@ -213,7 +213,17 @@ $box = 'riai-box-' . $purchaseId;
 .riai table{border-collapse:collapse;background:#fff;width:100%}
 .riai th,.riai td{border:1px solid #e1e5ea;padding:6px 8px;vertical-align:top;text-align:left}
 .riai th{background:#f5f7f9;font-weight:600;color:#525c69}
-.riai .riai-matrix td.c,.riai .riai-matrix th.c{text-align:center;min-width:150px}
+.riai .riai-scroll{overflow-x:auto;max-width:100%;border:1px solid #e1e5ea}
+.riai .riai-matrix{width:auto;min-width:100%;border-collapse:separate;border-spacing:0}
+.riai .riai-matrix td.c,.riai .riai-matrix th.c{text-align:center;min-width:170px;max-width:220px}
+/* колонки «Позиция» и «Кол-во» остаются на месте при прокрутке вправо */
+.riai .riai-matrix .riai-fix1{position:sticky;left:0;z-index:2;background:#fff;box-sizing:border-box;
+  width:260px;min-width:260px;max-width:260px;overflow-wrap:anywhere}
+.riai .riai-matrix .riai-fix2{position:sticky;left:260px;z-index:2;background:#fff;box-sizing:border-box;
+  width:80px;min-width:80px;max-width:80px;
+  box-shadow:4px 0 6px -4px rgba(0,0,0,.15)}
+.riai .riai-matrix th.riai-fix1,.riai .riai-matrix th.riai-fix2{background:#f5f7f9;z-index:3}
+.riai .riai-hist{overflow-x:auto;max-width:100%}
 .riai .riai-matrix tr.sep td{background:#fafbfc}
 .riai .riai-muted{color:#80868e}
 .riai .riai-best{color:#2b8a3e;font-weight:700}
@@ -237,23 +247,23 @@ $box = 'riai-box-' . $purchaseId;
 <?php if (!$cols): ?>
 <div class="note">По истории предложить некого — позиции закупки раньше не встречались.</div>
 <?php else: ?>
+<div class="riai-scroll">
 <table class="riai-matrix">
 <tr>
-  <th>Позиция</th><th>Кол-во</th><th>Ед.</th>
+  <th class="riai-fix1">Позиция</th><th class="riai-fix2">Кол-во</th>
   <?php foreach ($cols as $s): ?>
   <th class="c"><a href="<?= $lnkCompany($s['company_id']) ?>" target="_blank"><?= $h($s['company']) ?></a></th>
   <?php endforeach; ?>
 </tr>
 <?php foreach ($r['positions'] as $p): ?>
 <tr>
-  <td><?= $num[$p['id']] ?>. <?= $h($p['name']) ?>
+  <td class="riai-fix1"><?= $num[$p['id']] ?>. <?= $h($p['name']) ?>
     <?php if (!empty($p['type'])): ?><div class="riai-muted riai-small"><?= $h($p['type']) ?></div><?php endif; ?></td>
-  <td><?= $h($p['qty']) ?></td>
-  <td><?= $h($p['unit']) ?></td>
+  <td class="riai-fix2"><?= $h($p['qty']) ?> <?= $h($p['unit']) ?></td>
   <?php foreach ($cols as $s): $c = $s['cells'][$p['id']] ?? null;
       $isBest = $c && empty($c['analog']) && $c['comparable'] && $c['unit_price'] !== null && isset($rowBest[$p['id']]) && $c['unit_price'] == $rowBest[$p['id']]; ?>
   <td class="c">
-    <?php if (!$c): ?><span class="riai-muted">—</span>
+    <?php if (!$c): ?><span class="riai-muted riai-small" title="В истории нет запросов этому поставщику по этой позиции">не запрашивали</span>
     <?php else: ?>
       <span class="<?= $isBest ? 'riai-best' : ($c['comparable'] ? '' : 'riai-muted') ?>"
             title="<?= $c['comparable'] ? '' : 'Другая единица — напрямую не сравнивать' ?>"><?= $priceHtml($c) ?></span><?= $c['selected'] ? ' <span class="riai-sel">✓</span>' : '' ?>
@@ -265,7 +275,7 @@ $box = 'riai-box-' . $purchaseId;
 </tr>
 <?php endforeach; ?>
 <tr>
-  <td colspan="3">Где была эта цена</td>
+  <td class="riai-fix1">Где была эта цена</td><td class="riai-fix2"></td>
   <?php foreach ($cols as $s): ?>
   <td class="c riai-small"><?php
       $lines = [];
@@ -282,7 +292,7 @@ $box = 'riai-box-' . $purchaseId;
   <?php endforeach; ?>
 </tr>
 <tr>
-  <td colspan="3">Надёжность</td>
+  <td class="riai-fix1">Надёжность</td><td class="riai-fix2"></td>
   <?php foreach ($cols as $s): ?>
   <td class="c riai-small">
     Брали: <b><?= (int)$s['wins'] ?></b> из <?= (int)$s['offers'] ?> предложений<br>
@@ -291,7 +301,7 @@ $box = 'riai-box-' . $purchaseId;
   <?php endforeach; ?>
 </tr>
 <tr>
-  <td colspan="3"></td>
+  <td class="riai-fix1"></td><td class="riai-fix2"></td>
   <?php foreach ($cols as $s): $ex = $existing[(int)$s['company_id']] ?? null; ?>
   <td class="c">
     <?php if ($ex): ?>
@@ -315,6 +325,7 @@ $box = 'riai-box-' . $purchaseId;
   <?php endforeach; ?>
 </tr>
 </table>
+</div>
 <?php if (count($r['suppliers']) > RIAI_COLUMNS): ?>
 <div class="riai-muted riai-small" style="margin-top:4px">Ещё поставщиков в истории: <?= count($r['suppliers']) - RIAI_COLUMNS ?> — см. таблицы ниже.</div>
 <?php endif; ?>
@@ -330,7 +341,7 @@ $box = 'riai-box-' . $purchaseId;
 <?php if (!$rows): ?>
 <div class="note">Раньше не закупали.</div>
 <?php else: ?>
-<table>
+<div class="riai-hist"><table>
 <tr><th>Дата</th><th>Поставщик</th><th>Цена</th><th>Выбран</th><th>Запрос</th><th>Закупка</th><th>Как называлась позиция</th></tr>
 <?php foreach (array_slice($rows, 0, 40) as $o): ?>
 <tr>
@@ -343,11 +354,11 @@ $box = 'riai-box-' . $purchaseId;
   <td class="riai-muted"><?= $h($o['hist']) ?> (<?= $h($o['hist_qty']) ?> <?= $h($o['hist_unit']) ?>)</td>
 </tr>
 <?php endforeach; ?>
-</table>
+</table></div>
 <?php endif; ?>
 <?php if (!empty($p['type_suppliers'])): ?>
 <div style="margin:10px 0 4px"><b>Аналоги того же типа</b> <span class="riai-muted riai-small">— кто возил другие марки/модели «<?= $h(array_slice(explode(' › ', $p['type']), -1)[0]) ?>»</span></div>
-<table>
+<div class="riai-hist"><table>
 <tr><th>Поставщик</th><th>Что возил</th><th>Предложений</th><th>Брали</th><th>Последнее предложение</th></tr>
 <?php foreach ($p['type_suppliers'] as $t): $o = $t['last']; ?>
 <tr>
@@ -358,7 +369,7 @@ $box = 'riai-box-' . $purchaseId;
   <td><?= $o ? $priceHtml($o) . ' <span class="riai-muted">· ' . $h($o['date']) . ' · ' . $h($o['position']) . '</span><br>' . $reqLink($o) : '—' ?></td>
 </tr>
 <?php endforeach; ?>
-</table>
+</table></div>
 <?php endif; ?>
 <?php endforeach; ?>
 </div>
