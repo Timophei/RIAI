@@ -282,6 +282,82 @@ def consolidate(workers=4, chunk=150, max_groups=25):
     print(f"После уборки: {len(tree)} разделов, {n_groups} групп, {n_types} типов → {TREE}")
 
 
+# ---------- 1в. доводка: «Перенесено» → в группы своего раздела, дубли типов между разделами → один ----------
+FIX_SYS = """Раздел «{section}» дерева номенклатуры. Группы раздела:
+{groups}
+Эти типы перенесены сюда из других разделов. Для каждого выбери номер подходящей группы; если ни одна не подходит —
+0 и предложи новую группу в поле "new". Название типа можно поправить в поле "t" (по-русски, во множественном числе).
+Ответ — JSON: {{"items":[{{"i":<номер типа>,"g":<номер группы или 0>,"new":"<новая группа, если g=0>","t":"<тип>"}}]}}"""
+
+
+def fix():
+    pairs = load_tree_examples()
+    if not pairs:
+        raise SystemExit(f"В {TREE} нет типов")
+    import shutil
+    shutil.copy(TREE, TREE + ".bak")
+    keep, moved = [], defaultdict(list)
+    groups = defaultdict(set)
+    for path, ex in pairs:
+        sec, grp, typ = path.split(" › ")
+        if grp == "Перенесено":
+            moved[sec].append((typ, ex))
+        else:
+            keep.append((path, ex))
+            groups[sec].add(grp)
+    print(f"Типов: {len(pairs)}; в «Перенесено»: {sum(len(v) for v in moved.values())} в {len(moved)} разделах")
+
+    def place(item):
+        sec, items = item
+        gl = sorted(groups[sec]) or ["Разное"]
+        res = chat_json(FIX_SYS.format(section=sec, groups="\n".join(f"{i}. {g}" for i, g in enumerate(gl, 1))),
+                        "Типы:\n" + "\n".join(f"{i}. {t}" + (f" // {'; '.join(ex[:2])}" if ex else "")
+                                              for i, (t, ex) in enumerate(items, 1)), model=TREE_MODEL)
+        got = {}
+        for it in res.get("items") or []:
+            try:
+                got[int(it["i"])] = it
+            except (KeyError, TypeError, ValueError):
+                pass
+        out = []
+        for i, (t, ex) in enumerate(items, 1):
+            it = got.get(i) or {}
+            t2 = str(it.get("t") or t).strip() or t
+            try:
+                g = int(it.get("g", 0))
+            except (TypeError, ValueError):
+                g = 0
+            grp = gl[g - 1] if 1 <= g <= len(gl) else (str(it.get("new") or "").strip() or "Разное")
+            out.append((f"{sec} › {grp} › {t2}", ex))
+        return out
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for got in ex.map(place, moved.items()):
+            keep += got
+
+    # дубли: один и тот же тип (без учёта регистра/ё) в нескольких местах → оставить там, где группа крупнее
+    size = defaultdict(int)
+    for path, _ in keep:
+        size[path.rsplit(" › ", 1)[0]] += 1
+    where = defaultdict(list)
+    for path, ex in keep:
+        where[path.rsplit(" › ", 1)[1].lower().replace("ё", "е")].append((path, ex))
+    final, merged = [], 0
+    for key, lst in where.items():
+        if len(lst) == 1:
+            final += lst
+            continue
+        best = max(lst, key=lambda x: size[x[0].rsplit(" › ", 1)[0]])
+        ex_all = [e for _, ex in lst for e in ex]
+        final.append((best[0], ex_all))
+        merged += len(lst) - 1
+    tree = build_tree(final)
+    save_tree(tree)
+    n_groups = sum(len(s["groups"]) for s in tree)
+    n_types = sum(len(g["types"]) for s in tree for g in s["groups"])
+    print(f"Склеено дублей: {merged}. Итог: {len(tree)} разделов, {n_groups} групп, {n_types} типов → {TREE}")
+
+
 # ---------- 2. разложить названия по дереву ----------
 CLASSIFY_SYS = """Ты раскладываешь товары из заявок на закупку по дереву номенклатуры.
 Для каждого товара выбери номер самого подходящего типа из списка. Смотри на назначение товара, а не на совпадение слов

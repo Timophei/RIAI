@@ -8,6 +8,7 @@
   llm-models        — какие модели доступны по ключу
   taxonomy-propose  — модель строит дерево типов по истории и убирает дубли → data/taxonomy.txt
   taxonomy-consolidate — ещё раз навести порядок в дереве (склеить дубли, укрупнить группы)
+  taxonomy-fix      — разложить «Перенесено» по группам и склеить одинаковые типы из разных разделов
   taxonomy-classify [--reset] [--limit N] — разложить все названия истории по дереву
 """
 import sys
@@ -40,6 +41,9 @@ def main():
     elif cmd == "taxonomy-consolidate":
         from .taxonomy import consolidate
         consolidate()
+    elif cmd == "taxonomy-fix":
+        from .taxonomy import fix
+        fix()
     elif cmd == "taxonomy-classify":
         from .taxonomy import classify
         lim = int(rest[rest.index("--limit") + 1]) if "--limit" in rest else None
