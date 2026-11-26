@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from . import db
 from .discover import CONFIG
 from . import llm
-from .search import Index, price_ok, _sort_date, norm
+from .search import Index, price_ok, _sort_date, norm, head
 from .units import basis, unit_price, label, to_float
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -73,6 +73,13 @@ def resolve_types(names):
         except Exception as ex:   # модель недоступна — работаем без типов
             _state.setdefault("last_errors", []).append(f"типы: {ex}")
     return {k: v for k, v in got.items() if v and v != OTHER}
+
+
+def shares_word(a, b):
+    """Совпадает ли главное слово (первое существительное) по началу: «Термопаста …»≈«Термопасты …», «Лампа»≈«Лампочки»,
+    но «Патрон …» ≠ «лампочки … цоколь Е27»."""
+    ha, hb = head(a), head(b)
+    return bool(ha and hb and ha[:4] == hb[:4])
 
 
 def type_offers(idx, type_id, exclude_norms, purchase_id, exclude_pids, cap=300):
@@ -214,7 +221,10 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
                 if t["last"] is None or (of["price"] is not None, _sort_date(of["date"])) > \
                         (t["last"]["price"] is not None, _sort_date(t["last"]["date"])):
                     t["last"] = of
-                # в матрицу — только если по самой позиции у этого поставщика ничего нет
+                # в матрицу — только если по самой позиции у этого поставщика ничего нет и аналог
+                # похож по словам (защита от ошибок разметки: «лампочка … цоколь Е27» в типе «патроны»)
+                if not shares_word(p.get("name"), o["name"]):
+                    continue
                 d = by_sup.setdefault(o["company_id"], {
                     "company_id": o["company_id"], "company": o["company"], "position_ids": [],
                     "offers": 0, "wins": 0, "relevance": 0.0, "last": None, "purchase_ids": [],
