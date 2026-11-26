@@ -17,6 +17,7 @@ from datetime import datetime
 from . import db
 from .llm import chat_json
 from .search import head, norm
+import re
 
 TREE = os.path.join(db.DATA, "taxonomy.txt")
 OTHER = "Прочее › Не определено › Не определено"
@@ -382,17 +383,52 @@ TYPE_SYS = """Раздел каталога «{section}». Для каждого
 Ответ — JSON: {{"items":[{{"i":<номер товара>,"t":<номер типа>}}]}} — для каждого товара."""
 
 
+PICK_SYS = """Для каждого товара из заявки на закупку выбери номер подходящего варианта типа из его списка.
+Смотри на назначение товара; бренды и марки (Эмако, Реламикс, Пемолюкс, Азелит) — это товары своего типа.
+0 — только если не подходит ни один вариант.
+Ответ — JSON: {"items":[{"i":<номер товара>,"c":<номер варианта или 0>}]}"""
+
+
 def _tree_index(leaves):
     by_sec = defaultdict(list)
     for p in leaves:
         by_sec[p.split(" › ")[0]].append(p)
     secs = list(by_sec)
-    return secs, by_sec
+    ex = {}
+    try:
+        ex = {p: e for p, e in load_tree_examples()}
+    except Exception:
+        pass
+    # поиск по тексту: название типа + группа + примеры — для страховки, когда раздел выбран неверно
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    docs = [norm(p.replace(" › ", " ") + " " + " ".join(ex.get(p, [])[:3])) for p in leaves]
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True, min_df=1)
+    X = vec.fit_transform(docs)
+    return secs, by_sec, ex, (vec, X, list(leaves))
+
+
+JUNK = re.compile(r"^(?:(?:тест|test)[\s\d_]*|ntcn|(?:перв|втор|трет|четв[её]рт|пят|шест)(?:ый|ой|ая|ья|ий|ое)?|"
+                  r"нов(?:ый|ая)|[\W\d_]+|\[.*)$", re.I)
+
+
+def _is_junk(raw):
+    r = (raw or "").strip().lower()
+    return bool(JUNK.match(r)) or len(re.findall(r"[a-zа-яё]", r)) < 2
 
 
 def _classify_batch(leaves, batch, index=None):
     """Два шага: раздел (из ~24), потом тип внутри раздела (из десятков) — на длинном списке модель сдаётся."""
-    secs, by_sec = index or _tree_index(leaves)
+    secs, by_sec, ex, retr = index or _tree_index(leaves)
+    out = {}
+    real = []
+    for n, raw in batch:   # явный мусор — без модели
+        if _is_junk(raw):
+            out[n] = OTHER
+        else:
+            real.append((n, raw))
+    batch = real
+    if not batch:
+        return out
     sec_lines = []
     for i, sname in enumerate(secs, 1):
         groups = sorted({p.split(" › ")[1] for p in by_sec[sname]})
@@ -407,19 +443,20 @@ def _classify_batch(leaves, batch, index=None):
             continue
         if 1 <= i <= len(batch):
             sec_of[i] = secs[sn - 1] if 1 <= sn <= len(secs) else None
-    out = {}
     groups_of = defaultdict(list)
+    missed = []
     for i, (n, raw) in enumerate(batch, 1):
         if i not in sec_of:
             continue                       # модель пропустила — останется к разметке в следующий раз
         if sec_of[i] is None:
-            out[n] = OTHER
+            missed.append((n, raw))
         else:
             groups_of[sec_of[i]].append((n, raw))
     for sname, items in groups_of.items():
         types = by_sec[sname]
         res = chat_json(TYPE_SYS.format(section=sname, types="\n".join(
-            f"{j}. {p.split(' › ', 1)[1]}" for j, p in enumerate(types, 1))),
+            f"{j}. {p.split(' › ', 1)[1]}" + (f" (напр. {ex[p][0][:45]})" if ex.get(p) else "")
+            for j, p in enumerate(types, 1))),
             "Товары:\n" + "\n".join(f"{j}. {raw[:120]}" for j, (_, raw) in enumerate(items, 1)))
         for it in res.get("items") or []:
             try:
@@ -427,7 +464,30 @@ def _classify_batch(leaves, batch, index=None):
             except (KeyError, TypeError, ValueError):
                 continue
             if 1 <= j <= len(items):
-                out[items[j - 1][0]] = types[t - 1] if 1 <= t <= len(types) else OTHER
+                if 1 <= t <= len(types):
+                    out[items[j - 1][0]] = types[t - 1]
+                else:
+                    missed.append(items[j - 1])
+    # страховка: для отвергнутых — 12 ближайших по тексту типов из всего дерева, модель выбирает из них
+    if missed:
+        vec, X, all_leaves = retr
+        blocks, cand = [], {}
+        for j, (n, raw) in enumerate(missed, 1):
+            sims = (X @ vec.transform([norm(raw)]).T).toarray().ravel()
+            top = [all_leaves[k] for k in sims.argsort()[::-1][:12]]
+            cand[j] = top
+            blocks.append(f"{j}. {raw[:120]}\n" + "\n".join(
+                f"   {k}) {p}" + (f" (напр. {ex[p][0][:40]})" if ex.get(p) else "") for k, p in enumerate(top, 1)))
+        res = chat_json(PICK_SYS, "\n".join(blocks))
+        for it in res.get("items") or []:
+            try:
+                j, c = int(it["i"]), int(it["c"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if j in cand:
+                out[missed[j - 1][0]] = cand[j][c - 1] if 1 <= c <= len(cand[j]) else OTHER
+        for j, (n, raw) in enumerate(missed, 1):
+            out.setdefault(n, OTHER)
     return out
 
 
