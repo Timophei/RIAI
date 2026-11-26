@@ -71,7 +71,7 @@ def _offer(o, want=None):
             "selected": bool(o["selected"]), "date": (o["date_create"] or "")[:10]}
 
 
-def advise(purchase_id, positions, k=8):
+def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
     """positions: [{"id", "name", "qty"?, "unit"?}] — позиции текущей закупки (передаёт портал).
     Для каждой: похожие позиции из истории и все их предложения; последняя выбранная; лучшая цена.
     Предложения текущей закупки и сами переданные позиции из истории исключаются."""
@@ -189,6 +189,29 @@ def advise(purchase_id, positions, k=8):
     # Порядок по умолчанию: больше позиций этой закупки → чаще выбирали → ближе по смыслу → свежее
     sups.sort(key=lambda d: (-len(d["position_ids"]), -d["wins"], -d["relevance"],
                              tuple(-int(x or 0) for x in _sort_date(d["last_date"]))))
+    # Столбцы матрицы: у каждой позиции — свои лучшие 3 поставщика (кого выбирали, с ценой, свежее),
+    # чтобы позиция не оставалась пустой из-за того, что столбцы заняли поставщики других позиций
+    pick, ranked = {}, []
+    for p in positions:
+        key = str(p.get("id"))
+        cand = [d for d in sups if key in d["cells"]]
+        cand.sort(key=lambda d: (d["cells"][key]["selected"],
+                                 d["cells"][key]["price"] is not None and d["cells"][key]["comparable"],
+                                 _sort_date(d["cells"][key]["date"]), d["wins"]), reverse=True)
+        ranked.append(cand[:per_position])
+        for d in cand[:per_position]:
+            pick.setdefault(d["company_id"], []).append(p.get("id"))
+    order = {d["company_id"]: i for i, d in enumerate(sups)}
+    columns = []   # по кругу: лучший у каждой позиции, затем вторые, затем третьи
+    for rank in range(per_position):
+        for cand in ranked:
+            if rank < len(cand) and cand[rank]["company_id"] not in columns and len(columns) < max_columns:
+                columns.append(cand[rank]["company_id"])
+    for d in sups:
+        d["top_for"] = pick.get(d["company_id"], [])
+    sups = [d for d in sups if d["company_id"] in set(columns)] + [d for d in sups if d["company_id"] not in set(columns)]
+    sups.sort(key=lambda d: columns.index(d["company_id"]) if d["company_id"] in columns else len(columns) + order[d["company_id"]])
+
     # Прошлые закупки: больше совпавших позиций → свежее
     purs = []
     for g in by_pur.values():
@@ -199,7 +222,7 @@ def advise(purchase_id, positions, k=8):
             "updated": (_state["sync"] or "")[:16].replace("T", " "),
             "sort": {"suppliers": "позиций этой закупки ↓, выбирали ↓, похожесть ↓, дата ↓",
                      "purchases": "совпавших позиций ↓, дата ↓"},
-            "positions": out, "suppliers": sups[:25], "purchases": purs[:15]}
+            "columns": columns, "positions": out, "suppliers": sups[:30], "purchases": purs[:15]}
 
 
 # ---------- HTML для проверки (/preview); на портале HTML строит ваш модуль из JSON ----------
@@ -334,12 +357,13 @@ async def api_advice(request: Request):
         return JSONResponse({"ok": False, "error": "нужен JSON: {purchase_id, positions:[{id,name,qty,unit}]}"},
                             status_code=400)
     k = max(1, min(int(body.get("matches") or 8), 20))
-    ck = (pid, k, json.dumps(positions, sort_keys=True, ensure_ascii=False), _state["sync"])
+    ncol = max(1, min(int(body.get("columns") or 8), 15))
+    ck = (pid, k, ncol, json.dumps(positions, sort_keys=True, ensure_ascii=False), _state["sync"])
     hit = _cache.get(ck)
     if hit and time.time() - hit[0] < CACHE_SEC and not body.get("refresh"):
         return JSONResponse(hit[1])
     try:
-        d = advise(pid, positions, k)
+        d = advise(pid, positions, k, max_columns=ncol)
     except Exception as ex:
         return JSONResponse({"ok": False, "error": f"{type(ex).__name__}: {ex}"}, status_code=500)
     if len(_cache) > 500:

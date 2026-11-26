@@ -13,7 +13,7 @@ use Bitrix\Main\Loader;
 
 const RIAI_PURCHASE_TYPE = 132;   // Закупки
 const RIAI_REQUEST_TYPE  = 183;   // Запрос поставщику
-const RIAI_COLUMNS       = 6;     // сколько поставщиков показывать столбцами в матрице
+const RIAI_COLUMNS       = 8;     // сколько поставщиков показывать столбцами в матрице (сервер отдаёт до 8)
 // Создавать ли вместе с запросом «Позиции предложения» (список 20) с пустой ценой по всем позициям закупки.
 // Включите, если сейчас их заводят вручную; не включайте, если их уже создаёт бизнес-процесс.
 const RIAI_CREATE_OFFER_ROWS = false;
@@ -187,7 +187,14 @@ $reqLink = fn($o) => $o['request_id']
 $num = [];
 foreach ($r['positions'] as $i => $p) $num[$p['id']] = $i + 1;
 
-$cols = array_slice($r['suppliers'], 0, RIAI_COLUMNS);
+// Столбцы подбирает сервер так, чтобы у каждой позиции были свои поставщики (сначала лучший у каждой, потом вторые…)
+$byId = [];
+foreach ($r['suppliers'] as $s) $byId[$s['company_id']] = $s;
+$cols = [];
+foreach (array_slice($r['columns'] ?? [], 0, RIAI_COLUMNS) as $cid) {
+    if (isset($byId[$cid])) $cols[] = $byId[$cid];
+}
+if (!$cols) $cols = array_slice($r['suppliers'], 0, RIAI_COLUMNS);
 // лучшая цена в строке (за базовую единицу, только сопоставимые)
 $rowBest = [];
 foreach ($r['positions'] as $p) {

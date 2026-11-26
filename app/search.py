@@ -24,6 +24,30 @@ def norm(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+STOP = {"для", "и", "в", "с", "на", "по", "из", "от", "до", "шт", "мм", "см", "м", "кг", "г", "л", "гр",
+        "тип", "цвет", "арт", "ооо"}
+
+
+def words(s):
+    """Слова для поиска по смыслу: «х/б» → «хб», «КПТ-8» → «кпт8» (короткие коды через дефис), без служебных."""
+    s = (s or "").lower().replace("ё", "е")
+    s = re.sub(r"\b([a-zа-я])/([a-zа-я])\b", r"\1\2", s)
+    s = re.sub(r"\b([a-zа-я]{1,5})[-_](\d)", r"\1\2", s)
+    s = norm(s)
+    return [w for w in re.findall(r"[a-zа-я0-9.]+", s) if w not in STOP and len(w) > 1]
+
+
+def head(s):
+    """Главное слово — первое «настоящее» слово названия: «Термопаста …» → «термопаста»."""
+    for w in words(s):
+        if re.search(r"[a-zа-я]{3,}", w) and not re.search(r"\d", w):
+            return w
+    return None
+
+
+HEAD_BONUS = 0.15
+
+
 def price_ok(p):
     return p is not None and p > 1  # 0 и 1 ₽ — заглушки «нет цены»
 
@@ -33,7 +57,7 @@ class Index:
 
     def __init__(self, con=None):
         self.con = con or db.connect()
-        groups = defaultdict(list)
+        groups, raw = defaultdict(list), {}
         for pid, name in self.con.execute("""
                 SELECT o.position_id, COALESCE(p.name, MAX(o.name)) FROM offers o
                 LEFT JOIN positions p ON p.id = o.position_id
@@ -41,12 +65,20 @@ class Index:
             n = norm(name)
             if n:
                 groups[n].append(pid)
+                raw.setdefault(n, name)
         self.names = list(groups)
         self.pids = [groups[n] for n in self.names]
-        del groups
+        raws = [raw[n] for n in self.names]
+        del groups, raw
+        # два взгляда на похожесть: по кусочкам букв (опечатки, слитное написание) и по словам
+        # (длинные описания: лишние слова запроса, которых нет в истории, не мешают)
         self.vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1, sublinear_tf=True,
                                    dtype=np.float32)
+        self.wvec = TfidfVectorizer(analyzer=words, sublinear_tf=True, dtype=np.float32)
         self.X = self.vec.fit_transform(self.names) if self.names else None
+        self.W = self.wvec.fit_transform(raws) if self.names else None
+        self.heads = np.array([head(r) or "" for r in raws], dtype=object)
+        del raws
 
     def _load(self, pids):
         q = ",".join("?" * len(pids))
@@ -74,7 +106,10 @@ class Index:
     def search(self, query, k=10, exclude_purchase=None, exclude_pids=()):
         if self.X is None:
             return []
-        sims = (self.X @ self.vec.transform([norm(query)]).T).toarray().ravel()
+        c = (self.X @ self.vec.transform([norm(query)]).T).toarray().ravel()
+        w = (self.W @ self.wvec.transform([query]).T).toarray().ravel()
+        h = head(query)
+        sims = np.maximum(c, w) + (HEAD_BONUS * (self.heads == h) if h else 0)
         out = []
         order = sims.argsort()[::-1]
         floor = max(NOT_FOUND, RELATIVE * float(sims[order[0]])) if len(order) else NOT_FOUND
