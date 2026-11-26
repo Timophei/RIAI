@@ -57,8 +57,9 @@ def index():
 
 # ---------- подсказки ----------
 # ---------- типы номенклатуры (дерево из taxonomy.txt, разметка в name_types) ----------
-def resolve_types(names):
-    """[как написано] → {нормализованное: путь типа}. Неизвестные — раскладывает моделью (если она настроена)."""
+def resolve_types(names, allow_llm=True):
+    """[как написано] → {нормализованное: путь типа}. Неизвестные — раскладывает моделью (если она настроена
+    и allow_llm): только для позиций самой закупки; похожие из истории без типа доразметит ночная задача."""
     from .taxonomy import OTHER, classify_names, TREE
     con = db.connect(threads=True)
     keys = {norm(n): n for n in names if norm(n)}
@@ -67,7 +68,7 @@ def resolve_types(names):
     q = ",".join("?" * len(keys))
     got = dict(con.execute(f"SELECT name, type_id FROM name_types WHERE name IN ({q})", list(keys)).fetchall())
     missing = [(k, v) for k, v in keys.items() if k not in got]
-    if missing and llm.configured() and os.path.exists(TREE):
+    if missing and allow_llm and llm.configured() and os.path.exists(TREE):
         try:
             got.update(classify_names(missing, con))
         except Exception as ex:   # модель недоступна — работаем без типов
@@ -118,6 +119,7 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
     """positions: [{"id", "name", "qty"?, "unit"?}] — позиции текущей закупки (передаёт портал).
     Для каждой: похожие позиции из истории и все их предложения; последняя выбранная; лучшая цена.
     Предложения текущей закупки и сами переданные позиции из истории исключаются."""
+    t_start = time.time()
     idx = index()
     pids = set()
     for p in positions:
@@ -127,17 +129,23 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
             pass
     out, by_sup, by_pur = [], {}, {}
     best_up = {}  # позиция -> лучшая сопоставимая цена за базовую единицу (для индекса цены поставщика)
+    t0 = time.time()
+    timing = {"index": round(t0 - t_start, 2)}
     qtypes = resolve_types([p.get("name") or "" for p in positions])   # тип каждой позиции закупки
+    timing["types"] = round(time.time() - t0, 2)
+    t_search = t_analog = 0.0
     for p in positions:
         pid_cur = p.get("id")
         want, _ = basis(p.get("name"), p.get("unit"), p.get("weight"))
         qtype = qtypes.get(norm(p.get("name") or ""))
+        t1 = time.time()
         hits = idx.search(p.get("name") or "", k=k * 2 if qtype else k,
                           exclude_purchase=purchase_id, exclude_pids=pids)
         if qtype and hits:
             # по смыслу: находка другого (известного) типа — не то же самое, даже если слова похожи
-            htypes = resolve_types([h["name"] for h in hits])
+            htypes = resolve_types([h["name"] for h in hits], allow_llm=False)
             hits = [h for h in hits if htypes.get(norm(h["name"]), qtype) == qtype][:k]
+        t_search += time.time() - t1
         offers = [o for h in hits for o in h["offers"]]
         won = sorted([o for o in offers if o["selected"] and price_ok(o["price"])],
                      key=lambda o: _sort_date(o["date_create"]), reverse=True)
@@ -206,6 +214,7 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
                     gs["offers"].append(dict(of, for_position_id=pid_cur))
         # --- аналоги того же типа: другие марки/модели, которые покупали у тех же или других поставщиков ---
         type_sup = {}
+        t1 = time.time()
         if qtype:
             seen = {norm(h["name"]) for h in hits} | {norm(p.get("name") or "")}
             for o in type_offers(idx, qtype, seen, purchase_id, pids):
@@ -237,6 +246,7 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
                         d["position_ids"].append(pid_cur)
                     if d["last"] is None:
                         d["last"] = of
+        t_analog += time.time() - t1
         out.append({
             "id": pid_cur, "name": p.get("name"), "qty": p.get("qty"), "unit": p.get("unit"),
             "base_unit": label(want), "type": qtype,
@@ -306,7 +316,9 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
             "updated": (_state["sync"] or "")[:16].replace("T", " "),
             "sort": {"suppliers": "позиций этой закупки ↓, выбирали ↓, похожесть ↓, дата ↓",
                      "purchases": "совпавших позиций ↓, дата ↓"},
-            "columns": columns, "positions": out, "suppliers": sups[:30], "purchases": purs[:15]}
+            "columns": columns, "positions": out, "suppliers": sups[:30], "purchases": purs[:15],
+            "timing": dict(timing, search=round(t_search, 2), analogs=round(t_analog, 2),
+                           total=round(time.time() - t_start, 2))}
 
 
 # ---------- HTML для проверки (/preview); на портале HTML строит ваш модуль из JSON ----------
