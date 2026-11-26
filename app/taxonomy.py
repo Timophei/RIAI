@@ -151,7 +151,7 @@ def propose(top=1500, chunk=120, workers=4):
         for i, h in enumerate(hs, 1):
             ex = "; ".join(r[:70] for _, r in sorted(by_head[h], reverse=True)[:3])
             lines.append(f"{i}. {h} — {ex}")
-        res = chat_json(sys_prompt, "Слова:\n" + "\n".join(lines))
+        res = chat_json(sys_prompt, "Слова:\n" + "\n".join(lines), model=TREE_MODEL)
         out = {}
         for it in res.get("items") or []:
             try:
@@ -189,59 +189,92 @@ def propose(top=1500, chunk=120, workers=4):
     consolidate(workers=workers)
 
 
-# ---------- 1б. уборка дерева: синонимы, дубли, мусор, укрупнение групп ----------
-CONSOLIDATE_SYS = """Ты наводишь порядок в разделе «{section}» дерева номенклатуры закупок промышленно-строительного предприятия.
-Тебе дают типы раздела в виде «N. Группа › Тип // примеры названий». Для каждого выдай новый путь «Раздел › Группа › Тип»:
-- объедини в один тип синонимы, опечатки, единственное/множественное число и слишком узкие варианты
-  («Круг» и «Круги»; «Сопла» и «Сапла»; «Профтрубы», «Профильные трубы», «Профилированные трубы»);
-- в разделе должно быть 5–25 групп; группа заметно шире типа (не «Болты › Болты», а «Крепёж резьбовой › Болты»);
+# ---------- 1б. уборка дерева: в два шага — сначала группы раздела, потом каждый тип в одну из них ----------
+TREE_MODEL = os.environ.get("LLM_TREE_MODEL") or None   # для построения дерева можно взять модель посильнее
+
+GROUPS_SYS = """Ты наводишь порядок в разделе «{section}» дерева номенклатуры закупок промышленно-строительного предприятия.
+Тебе дают все типы товаров раздела. Придумай для раздела от 5 до {max_groups} групп — крупных направлений,
+по которым удобно искать поставщиков (например для «Метизы и крепёж»: «Крепёж резьбовой», «Анкеры и дюбели»,
+«Саморезы и шурупы», «Гвозди», «Такелаж и стропы», «Хомуты и зажимы»…). Группы не должны дублировать друг друга.
+Ответ — JSON: {{"groups":["...","..."]}}"""
+
+ASSIGN_SYS = """Раздел «{section}» дерева номенклатуры. Группы раздела:
+{groups}
+Для каждого типа из списка выбери номер группы и дай каноническое название типа:
+- синонимы, опечатки, единственное/множественное число, узкие варианты — ОДНО и то же название
+  («Круг», «Круги», «Круги стальные» → «Круги»; «Сопла», «Сапла» → «Сопла»);
 - тип — товары, которые заменяют друг друга или берутся у одних поставщиков; не дроби по маркам и размерам;
-- если тип явно из другого раздела — перенеси в подходящий из списка: {sections};
-- мусор, тесты, обрывки слов, ссылки, «первая/вторая позиция» → «Прочее › Мусор › Мусор».
-Названия — по-русски, во множественном числе, как в каталогах.
-Ответ — JSON: {{"items":[{{"i":<номер>,"path":"Раздел › Группа › Тип"}}]}} — для каждого номера."""
+- если тип явно не из этого раздела — g=0 и укажи раздел s из списка: {sections};
+- мусор, тесты, обрывки, ссылки, «первая/вторая позиция» — g=-1.
+Названия по-русски, во множественном числе.
+Ответ — JSON: {{"items":[{{"i":<номер типа>,"g":<номер группы>,"t":"<тип>","s":"<раздел, только если g=0>"}}]}}"""
 
 
-def consolidate(workers=4, chunk=220):
+def consolidate(workers=4, chunk=150, max_groups=25):
     pairs = load_tree_examples()
+    if not pairs:
+        raise SystemExit(f"В {TREE} нет типов — уборка не нужна (файл не тронут)")
+    import shutil
+    shutil.copy(TREE, TREE + ".bak")   # предыдущая версия дерева — рядом
     by_sec = defaultdict(list)
     for path, ex in pairs:
         by_sec[path.split(" › ")[0]].append((path, ex))
-    jobs = []
-    for sec, items in by_sec.items():
-        for i in range(0, len(items), chunk):
-            jobs.append((sec, items[i:i + chunk]))
-    print(f"Уборка: типов {len(pairs)}, разделов {len(by_sec)}, запросов к модели: {len(jobs)}")
+    print(f"Уборка: типов {len(pairs)}, разделов {len(by_sec)}"
+          + (f", модель для дерева: {TREE_MODEL}" if TREE_MODEL else ""))
 
-    def ask(job):
-        sec, items = job
-        sys_prompt = CONSOLIDATE_SYS.format(section=sec, sections="; ".join(SECTIONS))
-        lines = [f"{i}. {p.split(' › ', 1)[1]}" + (f" // {'; '.join(ex[:2])}" if ex else "")
-                 for i, (p, ex) in enumerate(items, 1)]
-        res = chat_json(sys_prompt, "\n".join(lines))
+    def do_section(item):
+        sec, items = item
+        if sec == "Прочее":
+            mg = 15
+        else:
+            mg = max_groups
+        names = sorted({p.split(" › ")[2] for p, _ in items})
+        gr = chat_json(GROUPS_SYS.format(section=sec, max_groups=mg), "Типы раздела:\n" + "\n".join(names),
+                       model=TREE_MODEL)
+        groups = [str(g).strip() for g in (gr.get("groups") or []) if str(g).strip()][:mg] or ["Разное"]
         out = []
-        mapped = {}
-        for it in res.get("items") or []:
-            try:
-                i, path = int(it["i"]), str(it["path"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            parts = [x.strip() for x in path.split("›")]
-            if 1 <= i <= len(items) and len(parts) == 3 and all(parts):
-                if parts[0] not in SECTIONS:
-                    parts[0] = sec
-                mapped[i] = " › ".join(parts)
-        for i, (p, ex) in enumerate(items, 1):
-            out.append((mapped.get(i, p), ex))   # не ответила по типу — оставляем как было
+        for c in range(0, len(items), chunk):
+            part = items[c:c + chunk]
+            lines = [f"{i}. {p.split(' › ')[2]}" + (f" // {'; '.join(ex[:2])}" if ex else "")
+                     for i, (p, ex) in enumerate(part, 1)]
+            res = chat_json(ASSIGN_SYS.format(section=sec, sections="; ".join(SECTIONS),
+                                              groups="\n".join(f"{i}. {g}" for i, g in enumerate(groups, 1))),
+                            "Типы:\n" + "\n".join(lines), model=TREE_MODEL)
+            got = {}
+            for it in res.get("items") or []:
+                try:
+                    got[int(it["i"])] = it
+                except (KeyError, TypeError, ValueError):
+                    continue
+            for i, (p, ex) in enumerate(part, 1):
+                it = got.get(i)
+                typ = p.split(" › ")[2]
+                if not it:
+                    out.append((f"{sec} › {groups[0]} › {typ}", ex))
+                    continue
+                t = str(it.get("t") or typ).strip() or typ
+                try:
+                    g = int(it.get("g", 1))
+                except (TypeError, ValueError):
+                    g = 1
+                if g == -1:
+                    out.append(("Прочее › Мусор › Мусор", ex))
+                elif g == 0:
+                    s2 = str(it.get("s") or "").strip()
+                    out.append((f"{s2 if s2 in SECTIONS else sec} › Перенесено › {t}", ex))
+                else:
+                    out.append((f"{sec} › {groups[min(max(g, 1), len(groups)) - 1]} › {t}", ex))
         return out
 
     result, done = [], 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for got in ex.map(ask, jobs):
+        for got in ex.map(do_section, by_sec.items()):
             result += got
             done += 1
-            print(f"\r  запросов: {done}/{len(jobs)}", end="", flush=True)
+            print(f"\r  разделов: {done}/{len(by_sec)}", end="", flush=True)
     print()
+    # «Перенесено» в чужой раздел — разложить по группам того раздела вторым кругом не будем: оставляем отдельной группой,
+    # её видно в файле и можно поправить руками или ещё одним запуском consolidate
     tree = build_tree(result)
     save_tree(tree)
     n_groups = sum(len(s["groups"]) for s in tree)
