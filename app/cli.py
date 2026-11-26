@@ -9,7 +9,8 @@
   taxonomy-propose  — модель строит дерево типов по истории и убирает дубли → data/taxonomy.txt
   taxonomy-consolidate — ещё раз навести порядок в дереве (склеить дубли, укрупнить группы)
   taxonomy-fix      — разложить «Перенесено» по группам и склеить одинаковые типы из разных разделов
-  taxonomy-classify [--reset] [--retry-other] [--limit N] — разложить названия истории по дереву
+  taxonomy-classify [--reset] [--retry-other] [--limit N] [--yes] — разложить названия истории по дереву
+                      (больше 2000 названий — только с --yes)
                       (--retry-other — повторить только «Не определено»)
   taxonomy-other [N] — показать самые частые названия, не подошедшие ни к одному типу
 """
@@ -52,7 +53,7 @@ def main():
     elif cmd == "taxonomy-classify":
         from .taxonomy import classify
         lim = int(rest[rest.index("--limit") + 1]) if "--limit" in rest else None
-        classify(reset="--reset" in rest, limit=lim, retry_other="--retry-other" in rest)
+        classify(reset="--reset" in rest, limit=lim, retry_other="--retry-other" in rest, yes="--yes" in rest)
     else:
         print(f"Неизвестная команда: {cmd}\n{__doc__}")
         sys.exit(2)

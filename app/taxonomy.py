@@ -519,21 +519,32 @@ def classify_names(pairs, con=None, workers=1, size=80, progress=None):
     return result
 
 
-def classify(reset=False, limit=None, workers=4, retry_other=False):
+def classify(reset=False, limit=None, workers=4, retry_other=False, yes=False):
     con = db.connect()
     load_tree()   # проверить, что дерево есть
     if reset:
         con.execute("DELETE FROM name_types")
         con.commit()
-    if retry_other:   # повторить только «Не определено»
-        n = con.execute("DELETE FROM name_types WHERE type_id=?", (OTHER,)).rowcount
+    only = None
+    if retry_other:   # повторить ТОЛЬКО то, что сейчас в «Не определено»
+        only = {r[0] for r in con.execute("SELECT name FROM name_types WHERE type_id=?", (OTHER,))}
+        con.execute("DELETE FROM name_types WHERE type_id=?", (OTHER,))
         con.commit()
-        print(f"Повторная разметка «Не определено»: {n} названий")
+        print(f"Повторная разметка «Не определено»: {len(only)} названий")
     have = {r[0] for r in con.execute("SELECT name FROM name_types")}
     names = history_names(con)
-    todo = sorted(((n, raw) for n, (raw, c) in names.items() if n not in have), key=lambda x: -names[x[0]][1])
+    todo = sorted(((n, raw) for n, (raw, c) in names.items() if n not in have and (only is None or n in only)),
+                  key=lambda x: -names[x[0]][1])
     if limit:
         todo = todo[:limit]
+    if len(todo) > 2000 and not yes:   # предохранитель от случайного большого запуска
+        print(f"К разметке {len(todo)} названий (~{len(todo) // 40 + 1} пачек, по 2–5 запросов к модели на пачку).\n"
+              f"Это заметные деньги. Если всё верно — добавьте --yes, или ограничьте: --limit N")
+        if only is not None:   # вернуть «Не определено» на место, раз не размечаем
+            con.executemany("INSERT OR IGNORE INTO name_types VALUES(?,?,?,?)",
+                            [(n, OTHER, "", "") for n in only])
+            con.commit()
+        return
     print(f"Названий всего: {len(names)}, уже разложено: {len(have)}, к разметке: {len(todo)} "
           f"(~{len(todo) // 40 + 1} пачек по 40, по 2–5 запросов на пачку)")
     if not todo:
@@ -541,6 +552,10 @@ def classify(reset=False, limit=None, workers=4, retry_other=False):
     got = classify_names(todo, con, workers=workers, size=40,
                          progress=lambda d, t: print(f"\r  пачек: {d}/{t}", end="", flush=True))
     print()
+    if only is not None:   # что не удалось разметить заново — вернуть в «Не определено», чтобы не потерять
+        back = [(n, OTHER, "", "") for n in only if n not in got]
+        con.executemany("INSERT OR IGNORE INTO name_types VALUES(?,?,?,?)", back)
+        con.commit()
     miss = sum(1 for v in got.values() if v == OTHER)
     print(f"В этом запуске: разложено {len(got)}, из них «не подошло» {miss} ({miss * 100 // max(len(got), 1)}%)")
     top = con.execute("SELECT type_id, COUNT(*) c FROM name_types GROUP BY type_id ORDER BY c DESC LIMIT 15").fetchall()
