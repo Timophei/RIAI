@@ -11,6 +11,7 @@
   taxonomy-fix      — разложить «Перенесено» по группам и склеить одинаковые типы из разных разделов
   taxonomy-classify [--reset] [--retry-other] [--limit N] — разложить названия истории по дереву
                       (--retry-other — повторить только «Не определено»)
+  taxonomy-other [N] — показать самые частые названия, не подошедшие ни к одному типу
 """
 import sys
 
@@ -42,6 +43,9 @@ def main():
     elif cmd == "taxonomy-consolidate":
         from .taxonomy import consolidate
         consolidate()
+    elif cmd == "taxonomy-other":
+        from .taxonomy import show_other
+        show_other(int(rest[0]) if rest else 80)
     elif cmd == "taxonomy-fix":
         from .taxonomy import fix
         fix()

@@ -478,17 +478,30 @@ def classify(reset=False, limit=None, workers=4, retry_other=False):
           f"(~{len(todo) // 40 + 1} пачек по 40, по 2–5 запросов на пачку)")
     if not todo:
         return
-    classify_names(todo, con, workers=workers, size=40,
-                   progress=lambda d, t: print(f"\r  пачек: {d}/{t}", end="", flush=True))
+    got = classify_names(todo, con, workers=workers, size=40,
+                         progress=lambda d, t: print(f"\r  пачек: {d}/{t}", end="", flush=True))
     print()
+    miss = sum(1 for v in got.values() if v == OTHER)
+    print(f"В этом запуске: разложено {len(got)}, из них «не подошло» {miss} ({miss * 100 // max(len(got), 1)}%)")
     top = con.execute("SELECT type_id, COUNT(*) c FROM name_types GROUP BY type_id ORDER BY c DESC LIMIT 15").fetchall()
     print("Самые наполненные типы:")
     for t, c in top:
         print(f"  {c:6}  {t}")
     other = con.execute("SELECT COUNT(*) FROM name_types WHERE type_id=?", (OTHER,)).fetchone()[0]
     total = con.execute("SELECT COUNT(*) FROM name_types").fetchone()[0]
-    print(f"Не подошло ни к одному типу: {other} из {total} ({other * 100 // max(total, 1)}%). "
-          f"Повторить только их: taxonomy-classify --retry-other")
+    print(f"Всего в базе «не подошло»: {other} из {total} ({other * 100 // max(total, 1)}%). "
+          f"Посмотреть их: taxonomy-other; повторить: taxonomy-classify --retry-other")
+
+
+def show_other(n=80):
+    con = db.connect()
+    names = history_names(con)
+    rows = [r[0] for r in con.execute("SELECT name FROM name_types WHERE type_id=?", (OTHER,))]
+    rows.sort(key=lambda x: -names.get(x, ("", 0))[1])
+    print(f"«Не подошло»: {len(rows)}. Самые частые {min(n, len(rows))}:")
+    for r in rows[:n]:
+        raw, c = names.get(r, (r, 0))
+        print(f"  {c:4}  {raw[:100]}")
 
 
 if __name__ == "__main__":
