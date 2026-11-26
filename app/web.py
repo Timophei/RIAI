@@ -20,7 +20,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from . import db
 from .discover import CONFIG
-from .search import Index, price_ok, _sort_date
+from . import llm
+from .search import Index, price_ok, _sort_date, norm
 from .units import basis, unit_price, label, to_float
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -55,6 +56,41 @@ def index():
 
 
 # ---------- подсказки ----------
+# ---------- типы номенклатуры (дерево из taxonomy.txt, разметка в name_types) ----------
+def resolve_types(names):
+    """[как написано] → {нормализованное: путь типа}. Неизвестные — раскладывает моделью (если она настроена)."""
+    from .taxonomy import OTHER, classify_names, TREE
+    con = db.connect(threads=True)
+    keys = {norm(n): n for n in names if norm(n)}
+    if not keys:
+        return {}
+    q = ",".join("?" * len(keys))
+    got = dict(con.execute(f"SELECT name, type_id FROM name_types WHERE name IN ({q})", list(keys)).fetchall())
+    missing = [(k, v) for k, v in keys.items() if k not in got]
+    if missing and llm.configured() and os.path.exists(TREE):
+        try:
+            got.update(classify_names(missing, con))
+        except Exception as ex:   # модель недоступна — работаем без типов
+            _state.setdefault("last_errors", []).append(f"типы: {ex}")
+    return {k: v for k, v in got.items() if v and v != OTHER}
+
+
+def type_offers(idx, type_id, exclude_norms, purchase_id, exclude_pids, cap=300):
+    """Предложения по всем позициям истории того же типа (аналоги), свежие сначала."""
+    con = db.connect(threads=True)
+    norms = [r[0] for r in con.execute("SELECT name FROM name_types WHERE type_id=?", (type_id,))]
+    pids = []
+    for n in norms:
+        if n in exclude_norms or n not in idx.pos_of:
+            continue
+        pids += [x for x in idx.pids[idx.pos_of[n]] if x not in exclude_pids]
+    pids = sorted(pids, reverse=True)[:cap]   # самые новые позиции
+    if not pids:
+        return []
+    rows = [o for p in idx._load(pids).values() for o in p["offers"] if o["purchase_id"] != purchase_id]
+    return sorted(rows, key=lambda o: _sort_date(o["date_create"]), reverse=True)
+
+
 def _offer(o, want=None):
     """Предложение из истории со всеми ID, по которым портал строит ссылки.
     unit — единица той позиции; unit_price — цена за базовую единицу (кг, л, м…), если её можно вычислить;
@@ -67,7 +103,7 @@ def _offer(o, want=None):
             "purchase_id": o["purchase_id"],
             "price": price, "unit": o.get("unit"),
             "unit_price": round(up, 2) if up is not None else None, "base_unit": label(base),
-            "comparable": bool(want and base == want),
+            "comparable": bool(want and base == want), "analog": False,
             "selected": bool(o["selected"]), "date": (o["date_create"] or "")[:10]}
 
 
@@ -84,10 +120,17 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
             pass
     out, by_sup, by_pur = [], {}, {}
     best_up = {}  # позиция -> лучшая сопоставимая цена за базовую единицу (для индекса цены поставщика)
+    qtypes = resolve_types([p.get("name") or "" for p in positions])   # тип каждой позиции закупки
     for p in positions:
         pid_cur = p.get("id")
         want, _ = basis(p.get("name"), p.get("unit"), p.get("weight"))
-        hits = idx.search(p.get("name") or "", k=k, exclude_purchase=purchase_id, exclude_pids=pids)
+        qtype = qtypes.get(norm(p.get("name") or ""))
+        hits = idx.search(p.get("name") or "", k=k * 2 if qtype else k,
+                          exclude_purchase=purchase_id, exclude_pids=pids)
+        if qtype and hits:
+            # по смыслу: находка другого (известного) типа — не то же самое, даже если слова похожи
+            htypes = resolve_types([h["name"] for h in hits])
+            hits = [h for h in hits if htypes.get(norm(h["name"]), qtype) == qtype][:k]
         offers = [o for h in hits for o in h["offers"]]
         won = sorted([o for o in offers if o["selected"] and price_ok(o["price"])],
                      key=lambda o: _sort_date(o["date_create"]), reverse=True)
@@ -154,9 +197,40 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
                                                     "wins": 0, "offers": []})
                     gs["wins"] += 1 if o["selected"] else 0
                     gs["offers"].append(dict(of, for_position_id=pid_cur))
+        # --- аналоги того же типа: другие марки/модели, которые покупали у тех же или других поставщиков ---
+        type_sup = {}
+        if qtype:
+            seen = {norm(h["name"]) for h in hits} | {norm(p.get("name") or "")}
+            for o in type_offers(idx, qtype, seen, purchase_id, pids):
+                if not o["company_id"]:
+                    continue
+                of = dict(_offer(o, want), analog=True)
+                t = type_sup.setdefault(o["company_id"], {"company_id": o["company_id"], "company": o["company"],
+                                                          "offers": 0, "wins": 0, "last": None, "items": []})
+                t["offers"] += 1
+                t["wins"] += 1 if o["selected"] else 0
+                if o["name"] not in t["items"] and len(t["items"]) < 5:
+                    t["items"].append(o["name"])
+                if t["last"] is None or (of["price"] is not None, _sort_date(of["date"])) > \
+                        (t["last"]["price"] is not None, _sort_date(t["last"]["date"])):
+                    t["last"] = of
+                # в матрицу — только если по самой позиции у этого поставщика ничего нет
+                d = by_sup.setdefault(o["company_id"], {
+                    "company_id": o["company_id"], "company": o["company"], "position_ids": [],
+                    "offers": 0, "wins": 0, "relevance": 0.0, "last": None, "purchase_ids": [],
+                    "best_count": 0, "priced_count": 0, "cells": {}, "_best": {}, "_rel": {}})
+                cell = d["cells"].get(str(pid_cur))
+                if cell is None or (cell["analog"] and (of["price"] is not None, _sort_date(of["date"])) >
+                                    (cell["price"] is not None, _sort_date(cell["date"]))):
+                    d["cells"][str(pid_cur)] = of
+                    if pid_cur not in d["position_ids"]:
+                        d["position_ids"].append(pid_cur)
+                    if d["last"] is None:
+                        d["last"] = of
         out.append({
             "id": pid_cur, "name": p.get("name"), "qty": p.get("qty"), "unit": p.get("unit"),
-            "base_unit": label(want),
+            "base_unit": label(want), "type": qtype,
+            "type_suppliers": sorted(type_sup.values(), key=lambda t: (-t["wins"], -t["offers"]))[:10],
             "status": "found" if won else "asked" if hits else "new",   # брали / только запрашивали / не было
             "last_selected": _offer(won[0], want) if won else None,
             "best_price": priced[0][0] if priced else None,
@@ -195,7 +269,7 @@ def advise(purchase_id, positions, k=8, max_columns=8, per_position=3):
     for p in positions:
         key = str(p.get("id"))
         cand = [d for d in sups if key in d["cells"]]
-        cand.sort(key=lambda d: (d["cells"][key]["selected"],
+        cand.sort(key=lambda d: (not d["cells"][key]["analog"], d["cells"][key]["selected"],
                                  d["cells"][key]["price"] is not None and d["cells"][key]["comparable"],
                                  _sort_date(d["cells"][key]["date"]), d["wins"]), reverse=True)
         ranked.append(cand[:per_position])

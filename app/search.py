@@ -68,6 +68,7 @@ class Index:
                 raw.setdefault(n, name)
         self.names = list(groups)
         self.pids = [groups[n] for n in self.names]
+        self.pos_of = {n: i for i, n in enumerate(self.names)}   # нормализованное название → номер группы
         raws = [raw[n] for n in self.names]
         del groups, raw
         # два взгляда на похожесть: по кусочкам букв (опечатки, слитное написание) и по словам

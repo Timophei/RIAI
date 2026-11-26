@@ -200,7 +200,7 @@ $rowBest = [];
 foreach ($r['positions'] as $p) {
     foreach ($cols as $s) {
         $c = $s['cells'][$p['id']] ?? null;
-        if ($c && $c['comparable'] && $c['unit_price'] !== null
+        if ($c && empty($c['analog']) && $c['comparable'] && $c['unit_price'] !== null
             && (!isset($rowBest[$p['id']]) || $c['unit_price'] < $rowBest[$p['id']])) {
             $rowBest[$p['id']] = $c['unit_price'];
         }
@@ -219,6 +219,7 @@ $box = 'riai-box-' . $purchaseId;
 .riai .riai-best{color:#2b8a3e;font-weight:700}
 .riai .riai-sel{color:#2b8a3e}
 .riai .riai-small{font-size:12px}
+.riai .riai-analog{color:#a0662b}
 .riai h3{font-size:15px;margin:22px 0 8px}
 .riai .note{background:#f5f7f9;padding:8px 10px;border-radius:4px;margin-bottom:10px;color:#525c69}
 </style>
@@ -245,17 +246,19 @@ $box = 'riai-box-' . $purchaseId;
 </tr>
 <?php foreach ($r['positions'] as $p): ?>
 <tr>
-  <td><?= $num[$p['id']] ?>. <?= $h($p['name']) ?></td>
+  <td><?= $num[$p['id']] ?>. <?= $h($p['name']) ?>
+    <?php if (!empty($p['type'])): ?><div class="riai-muted riai-small"><?= $h($p['type']) ?></div><?php endif; ?></td>
   <td><?= $h($p['qty']) ?></td>
   <td><?= $h($p['unit']) ?></td>
   <?php foreach ($cols as $s): $c = $s['cells'][$p['id']] ?? null;
-      $isBest = $c && $c['comparable'] && $c['unit_price'] !== null && isset($rowBest[$p['id']]) && $c['unit_price'] == $rowBest[$p['id']]; ?>
+      $isBest = $c && empty($c['analog']) && $c['comparable'] && $c['unit_price'] !== null && isset($rowBest[$p['id']]) && $c['unit_price'] == $rowBest[$p['id']]; ?>
   <td class="c">
     <?php if (!$c): ?><span class="riai-muted">—</span>
     <?php else: ?>
       <span class="<?= $isBest ? 'riai-best' : ($c['comparable'] ? '' : 'riai-muted') ?>"
             title="<?= $c['comparable'] ? '' : 'Другая единица — напрямую не сравнивать' ?>"><?= $priceHtml($c) ?></span><?= $c['selected'] ? ' <span class="riai-sel">✓</span>' : '' ?>
       <div class="riai-muted riai-small"><?= $h($c['date']) ?></div>
+      <?php if (!empty($c['analog'])): ?><div class="riai-small riai-analog" title="Цена за другой товар того же типа">аналог: <?= $h($c['position']) ?></div><?php endif; ?>
     <?php endif; ?>
   </td>
   <?php endforeach; ?>
@@ -323,6 +326,7 @@ $box = 'riai-box-' . $purchaseId;
     usort($rows, fn($a, $b) => strcmp(implode('', array_reverse(explode('.', $b['date']))), implode('', array_reverse(explode('.', $a['date'])))));
 ?>
 <h3><?= $num[$p['id']] ?>. <?= $h($p['name']) ?> <span class="riai-muted">— <?= $h($p['qty']) ?> <?= $h($p['unit']) ?></span></h3>
+<?php if (!empty($p['type'])): ?><div class="riai-muted riai-small" style="margin:-4px 0 6px">Тип: <?= $h($p['type']) ?></div><?php endif; ?>
 <?php if (!$rows): ?>
 <div class="note">Раньше не закупали.</div>
 <?php else: ?>
@@ -337,6 +341,21 @@ $box = 'riai-box-' . $purchaseId;
   <td><?= $reqLink($o) ?></td>
   <td><?= $o['purchase_id'] ? '<a href="' . $lnkPurchase($o['purchase_id']) . '" target="_blank">' . (int)$o['purchase_id'] . '</a>' : '—' ?></td>
   <td class="riai-muted"><?= $h($o['hist']) ?> (<?= $h($o['hist_qty']) ?> <?= $h($o['hist_unit']) ?>)</td>
+</tr>
+<?php endforeach; ?>
+</table>
+<?php endif; ?>
+<?php if (!empty($p['type_suppliers'])): ?>
+<div style="margin:10px 0 4px"><b>Аналоги того же типа</b> <span class="riai-muted riai-small">— кто возил другие марки/модели «<?= $h(array_slice(explode(' › ', $p['type']), -1)[0]) ?>»</span></div>
+<table>
+<tr><th>Поставщик</th><th>Что возил</th><th>Предложений</th><th>Брали</th><th>Последнее предложение</th></tr>
+<?php foreach ($p['type_suppliers'] as $t): $o = $t['last']; ?>
+<tr>
+  <td><a href="<?= $lnkCompany($t['company_id']) ?>" target="_blank"><?= $h($t['company']) ?></a></td>
+  <td class="riai-small"><?= implode('<br>', array_map($h, $t['items'])) ?></td>
+  <td><?= (int)$t['offers'] ?></td>
+  <td><?= (int)$t['wins'] ?></td>
+  <td><?= $o ? $priceHtml($o) . ' <span class="riai-muted">· ' . $h($o['date']) . ' · ' . $h($o['position']) . '</span><br>' . $reqLink($o) : '—' ?></td>
 </tr>
 <?php endforeach; ?>
 </table>

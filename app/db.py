@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS requests(
   created TEXT, updated TEXT, stage TEXT, raw TEXT);
 CREATE TABLE IF NOT EXISTS companies(id INTEGER PRIMARY KEY, title TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS name_types(name TEXT PRIMARY KEY, type_id TEXT, model TEXT, ts TEXT);
+CREATE INDEX IF NOT EXISTS i_nt_type ON name_types(type_id);
 """
 
 

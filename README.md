@@ -94,6 +94,29 @@ location /supply-ai/ {
 вкладка при открытии грузит `/local/ajax/riai_advice.php?purchase=ID`.
 Диагностика: `/local/ajax/riai_advice.php?purchase=ID&debug=1` — какие подзаявки и позиции нашлись.
 
+## Этап 3: дерево типов номенклатуры (модель OpenAI или совместимая)
+
+В `.env`:
+```
+LLM_API_KEY=sk-...
+LLM_MODEL=gpt-4o-mini            # недорогая модель для разметки
+# LLM_BASE_URL=https://api.openai.com/v1   # для GigaChat/другого провайдера — свой адрес
+# LLM_PROXY=http://user:pass@host:port     # если провайдер недоступен напрямую
+```
+```bash
+docker compose run --rm app llm-check            # модель отвечает?
+docker compose run --rm app taxonomy-propose     # модель предлагает дерево → data/taxonomy.txt
+nano data/taxonomy.txt                            # поправить: # Раздел / ## Группа / - Тип
+docker compose run --rm app taxonomy-classify    # разложить все названия истории (продолжает после обрыва)
+docker compose restart web
+```
+Что даёт: находки другого типа отсеиваются (патрон для ламп ≠ патрон для перфоратора), у каждой позиции —
+«Аналоги того же типа» (кто возил другие марки), а если по самой позиции поставщиков мало — аналоги попадают в матрицу.
+Новые названия раскладываются при первом открытии вкладки и ночью:
+```cron
+0 * * * * cd /opt/riai && docker compose run --rm app sync >> data/sync.log 2>&1 && docker compose run --rm app taxonomy-classify >> data/sync.log 2>&1
+```
+
 ## Дальше
 - Кнопка «Создать запросы»: по запросу на поставщика + «Позиции предложения» с пустой ценой.
 - Разбор параметров (диаметр, объём, марка) и проверка совпадений моделью: «то же / аналог / не то».
