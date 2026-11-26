@@ -4,7 +4,8 @@
                       прерванная полная загрузка продолжается с места остановки
   sync --restart    — начать полную загрузку заново
   report [запросы]  — отчёт по позициям, напр.: report "Бумага А4" "Швеллер 40"
-  llm-check         — проверить доступ к модели (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROXY в .env)
+  llm-check [модель] — проверить доступ к модели (LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROXY в .env)
+  llm-models        — какие модели доступны по ключу
   taxonomy-propose  — модель строит дерево типов по истории и убирает дубли → data/taxonomy.txt
   taxonomy-consolidate — ещё раз навести порядок в дереве (склеить дубли, укрупнить группы)
   taxonomy-classify [--reset] [--limit N] — разложить все названия истории по дереву
@@ -29,7 +30,10 @@ def main():
         run(rest or None)
     elif cmd == "llm-check":
         from .llm import check
-        check()
+        check(rest[0] if rest else None)
+    elif cmd == "llm-models":
+        from .llm import list_models
+        list_models()
     elif cmd == "taxonomy-propose":
         from .taxonomy import propose
         propose()

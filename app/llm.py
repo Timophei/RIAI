@@ -49,6 +49,9 @@ def chat_json(system, user, model=None, temperature=0, retries=4, timeout=180):
             last = f"HTTP {r.status_code}: {r.text[:200]}"
             time.sleep(min(60, 3 * 2 ** attempt))
             continue
+        if r.status_code == 400 and "temperature" in r.text and "temperature" in body:
+            body.pop("temperature")       # «думающие» модели не принимают temperature — без неё
+            continue
         if r.status_code == 400 and "response_format" in r.text and "response_format" in body:
             body.pop("response_format")   # провайдер не умеет JSON-режим — просим JSON словами
             continue
@@ -65,7 +68,20 @@ def chat_json(system, user, model=None, temperature=0, retries=4, timeout=180):
     raise LLMError(f"Модель недоступна: {last}")
 
 
-def check():
+def check(model=None):
     r = chat_json("Ты отвечаешь строго JSON-объектом.",
-                  'Верни {"ok": true, "type": "<тип товара>"} для товара «Термопаста STEEL КПТ-8 [КПТ-8_20]».')
-    print("Модель отвечает:", r)
+                  'Верни {"ok": true, "type": "<тип товара>"} для товара «Термопаста STEEL КПТ-8 [КПТ-8_20]».',
+                  model=model)
+    print(f"Модель {model or os.environ.get('LLM_MODEL', 'gpt-4o-mini')} отвечает:", r)
+
+
+def list_models():
+    key = (os.environ.get("LLM_API_KEY") or "").strip()
+    base = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    proxy = os.environ.get("LLM_PROXY")
+    r = requests.get(f"{base}/models", headers={"Authorization": f"Bearer {key}"}, timeout=30,
+                     proxies={"http": proxy, "https": proxy} if proxy else None)
+    ids = sorted(m["id"] for m in r.json().get("data", []))
+    chat = [i for i in ids if re.match(r"^(gpt-|o\d|chatgpt)", i) and not re.search(
+        r"audio|realtime|transcribe|tts|image|search|embedding|instruct", i)]
+    print("Доступные модели для текста:\n  " + "\n  ".join(chat or ids))
