@@ -368,18 +368,66 @@ CLASSIFY_SYS = """Ты раскладываешь товары из заявок
 """
 
 
-def _classify_batch(leaves, batch):
-    sys_prompt = CLASSIFY_SYS + "\n".join(f"{i}. {p}" for i, p in enumerate(leaves, 1))
+SECTION_SYS = """Ты раскладываешь товары из заявок на закупку промышленно-строительного предприятия по разделам каталога.
+Для каждого товара выбери номер раздела. Смотри на назначение товара («Патрон Е27» — освещение,
+«Патрон для перфоратора» — расходники для инструмента). 0 — только если это не товар (мусор, тест, обрывок).
+Разделы (в скобках — их группы, для подсказки):
+{sections}
+Ответ — JSON: {{"items":[{{"i":<номер товара>,"s":<номер раздела>}}]}} — для каждого товара."""
+
+TYPE_SYS = """Раздел каталога «{section}». Для каждого товара выбери номер самого подходящего типа.
+Не требуй точного совпадения слов: подбери тип по назначению; если подходящего нет совсем — 0.
+Типы (Группа › Тип):
+{types}
+Ответ — JSON: {{"items":[{{"i":<номер товара>,"t":<номер типа>}}]}} — для каждого товара."""
+
+
+def _tree_index(leaves):
+    by_sec = defaultdict(list)
+    for p in leaves:
+        by_sec[p.split(" › ")[0]].append(p)
+    secs = list(by_sec)
+    return secs, by_sec
+
+
+def _classify_batch(leaves, batch, index=None):
+    """Два шага: раздел (из ~24), потом тип внутри раздела (из десятков) — на длинном списке модель сдаётся."""
+    secs, by_sec = index or _tree_index(leaves)
+    sec_lines = []
+    for i, sname in enumerate(secs, 1):
+        groups = sorted({p.split(" › ")[1] for p in by_sec[sname]})
+        sec_lines.append(f"{i}. {sname} ({'; '.join(groups[:25])})")
     user = "Товары:\n" + "\n".join(f"{i}. {raw[:120]}" for i, (_, raw) in enumerate(batch, 1))
-    res = chat_json(sys_prompt, user)
-    out = {}
+    res = chat_json(SECTION_SYS.format(sections="\n".join(sec_lines)), user)
+    sec_of = {}
     for it in res.get("items") or []:
         try:
-            i, t = int(it["i"]), int(it["t"])
+            i, sn = int(it["i"]), int(it["s"])
         except (KeyError, TypeError, ValueError):
             continue
         if 1 <= i <= len(batch):
-            out[batch[i - 1][0]] = leaves[t - 1] if 1 <= t <= len(leaves) else OTHER
+            sec_of[i] = secs[sn - 1] if 1 <= sn <= len(secs) else None
+    out = {}
+    groups_of = defaultdict(list)
+    for i, (n, raw) in enumerate(batch, 1):
+        if i not in sec_of:
+            continue                       # модель пропустила — останется к разметке в следующий раз
+        if sec_of[i] is None:
+            out[n] = OTHER
+        else:
+            groups_of[sec_of[i]].append((n, raw))
+    for sname, items in groups_of.items():
+        types = by_sec[sname]
+        res = chat_json(TYPE_SYS.format(section=sname, types="\n".join(
+            f"{j}. {p.split(' › ', 1)[1]}" for j, p in enumerate(types, 1))),
+            "Товары:\n" + "\n".join(f"{j}. {raw[:120]}" for j, (_, raw) in enumerate(items, 1)))
+        for it in res.get("items") or []:
+            try:
+                j, t = int(it["i"]), int(it["t"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 1 <= j <= len(items):
+                out[items[j - 1][0]] = types[t - 1] if 1 <= t <= len(types) else OTHER
     return out
 
 
@@ -387,11 +435,19 @@ def classify_names(pairs, con=None, workers=1, size=80, progress=None):
     """pairs: [(нормализованное, как написано)] → {нормализованное: путь}; результат сохраняется в name_types."""
     con = con or db.connect()
     leaves = load_tree()
+    index = _tree_index(leaves)
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
     batches = [pairs[i:i + size] for i in range(0, len(pairs), size)]
     done, result = 0, {}
+
+    def safe(b):
+        try:
+            return _classify_batch(leaves, b, index)
+        except Exception as ex:   # одна неудачная пачка не должна останавливать всю разметку
+            print(f"\n  пачка пропущена: {ex}")
+            return {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for got in ex.map(lambda b: _classify_batch(leaves, b), batches):
+        for got in ex.map(safe, batches):
             now = datetime.now().isoformat(timespec="seconds")
             con.executemany("INSERT OR REPLACE INTO name_types VALUES(?,?,?,?)",
                             [(n, t, model, now) for n, t in got.items()])
@@ -403,22 +459,26 @@ def classify_names(pairs, con=None, workers=1, size=80, progress=None):
     return result
 
 
-def classify(reset=False, limit=None, workers=4):
+def classify(reset=False, limit=None, workers=4, retry_other=False):
     con = db.connect()
     load_tree()   # проверить, что дерево есть
     if reset:
         con.execute("DELETE FROM name_types")
         con.commit()
+    if retry_other:   # повторить только «Не определено»
+        n = con.execute("DELETE FROM name_types WHERE type_id=?", (OTHER,)).rowcount
+        con.commit()
+        print(f"Повторная разметка «Не определено»: {n} названий")
     have = {r[0] for r in con.execute("SELECT name FROM name_types")}
     names = history_names(con)
     todo = sorted(((n, raw) for n, (raw, c) in names.items() if n not in have), key=lambda x: -names[x[0]][1])
     if limit:
         todo = todo[:limit]
     print(f"Названий всего: {len(names)}, уже разложено: {len(have)}, к разметке: {len(todo)} "
-          f"(~{len(todo) // 80 + 1} запросов к модели)")
+          f"(~{len(todo) // 40 + 1} пачек по 40, по 2–5 запросов на пачку)")
     if not todo:
         return
-    classify_names(todo, con, workers=workers,
+    classify_names(todo, con, workers=workers, size=40,
                    progress=lambda d, t: print(f"\r  пачек: {d}/{t}", end="", flush=True))
     print()
     top = con.execute("SELECT type_id, COUNT(*) c FROM name_types GROUP BY type_id ORDER BY c DESC LIMIT 15").fetchall()
@@ -426,7 +486,9 @@ def classify(reset=False, limit=None, workers=4):
     for t, c in top:
         print(f"  {c:6}  {t}")
     other = con.execute("SELECT COUNT(*) FROM name_types WHERE type_id=?", (OTHER,)).fetchone()[0]
-    print(f"Не подошло ни к одному типу: {other} — если много, добавьте типы в дерево и запустите с --reset")
+    total = con.execute("SELECT COUNT(*) FROM name_types").fetchone()[0]
+    print(f"Не подошло ни к одному типу: {other} из {total} ({other * 100 // max(total, 1)}%). "
+          f"Повторить только их: taxonomy-classify --retry-other")
 
 
 if __name__ == "__main__":
